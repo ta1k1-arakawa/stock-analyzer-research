@@ -268,6 +268,19 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "prices":
         print(update_prices(codes))
+    elif cmd == "debug-tdnet":
+        day = pd.Timestamp(sys.argv[2])
+        rows = list_rows(day)
+        print("rows:", len(rows))
+        for r in rows[:3]:
+            print(r)
+        for r in rows:
+            if r["code"] in set(codes):
+                print("UNIVERSE", r, doc_kind(r["title"]))
+        html = requests.get(f"{TDNET}I_list_001_{day:%Y%m%d}.html", headers=UA, timeout=30)
+        html.encoding = "utf-8"
+        i = html.text.find("kjCode")
+        print(html.text[max(0, i - 600): i + 1400])
     elif cmd == "fundamentals":
         print(update_fundamentals(codes, days=int(sys.argv[2]) if len(sys.argv) > 2 else 7))
     else:
