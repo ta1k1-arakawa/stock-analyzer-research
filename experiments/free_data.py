@@ -166,21 +166,61 @@ def doc_kind(title: str) -> tuple[str, str] | None:
     return None
 
 
+REVISION_QUEUE = FWD / "revision_queue.csv"
+REVISION_FIELDS = ["code", "disc_date", "disc_time", "disc_no", "pdf", "status"]
+
+
+def queue_revision(d: dict, day: pd.Timestamp) -> int:
+    """業績予想の修正 has no XBRL on TDnet: queue its PDF so Claude can read the new net-profit forecast."""
+    disc_no = re.sub(r"\D", "", d["pdf"])[-14:]
+    rows = []
+    if REVISION_QUEUE.exists():
+        with REVISION_QUEUE.open(newline="") as f:
+            rows = list(csv.DictReader(f))
+    if any(r["disc_no"] == disc_no for r in rows):
+        return 0
+    rows.append({"code": d["code"], "disc_date": str(day.date()), "disc_time": d["time"], "disc_no": disc_no,
+                 "pdf": d["pdf"], "status": "pending"})
+    with REVISION_QUEUE.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=REVISION_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    return 1
+
+
+def add_revision(code: str, disc_date: str, disc_time: str, disc_no: str, np_forecast: float | None) -> None:
+    rows = read_fund()
+    rows.append({"code": code, "disc_date": disc_date, "disc_time": disc_time, "disc_no": disc_no,
+                 "doc_type": "EarnForecastRevision", "per_type": "FY", "fy_end": "", "equity": "",
+                 "np_forecast": "" if np_forecast is None else str(int(np_forecast)), "shares_out": ""})
+    rows.sort(key=lambda x: (x["code"], x["disc_date"], x["disc_time"], x["disc_no"]))
+    with FUND.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FUND_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+
 def update_fundamentals(codes: list[str], days: int = 7) -> dict:
     """Append 決算短信 / 業績予想の修正 of universe codes from the last `days` calendar days."""
     rows = read_fund()
     seen = {(r["code"], r["disc_no"]) for r in rows}
     universe = set(codes)
-    added, failed, stats = 0, [], {"tdnet_rows": 0, "universe_docs": 0, "already_known": 0}
+    added, failed, stats = 0, [], {"tdnet_rows": 0, "universe_docs": 0, "already_known": 0, "revisions_queued": 0}
     today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
     for back in range(days):
         day = today - pd.Timedelta(days=back)
         for d in list_rows(day):
             stats["tdnet_rows"] += 1
             kind = doc_kind(d["title"])
-            if d["code"] not in universe or not kind or not d["xbrl"]:
+            if d["code"] not in universe or not kind:
                 continue
             stats["universe_docs"] += 1
+            if not d["xbrl"]:
+                if (d["code"], re.sub(r"\D", "", d["pdf"])[-14:]) in seen:
+                    stats["already_known"] += 1
+                elif kind[0] == "EarnForecastRevision":
+                    stats["revisions_queued"] += queue_revision(d, day)
+                continue
             disc_no = re.sub(r"\D", "", d["xbrl"])[-14:]
             if (d["code"], disc_no) in seen:
                 stats["already_known"] += 1
@@ -268,19 +308,6 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "prices":
         print(update_prices(codes))
-    elif cmd == "debug-tdnet":
-        day = pd.Timestamp(sys.argv[2])
-        rows = list_rows(day)
-        print("rows:", len(rows))
-        for r in rows[:3]:
-            print(r)
-        for r in rows:
-            if r["code"] in set(codes):
-                print("UNIVERSE", r, doc_kind(r["title"]))
-        html = requests.get(f"{TDNET}I_list_001_{day:%Y%m%d}.html", headers=UA, timeout=30)
-        html.encoding = "utf-8"
-        i = html.text.find("kjCode")
-        print(html.text[max(0, i - 600): i + 1400])
     elif cmd == "fundamentals":
         print(update_fundamentals(codes, days=int(sys.argv[2]) if len(sys.argv) > 2 else 7))
     else:

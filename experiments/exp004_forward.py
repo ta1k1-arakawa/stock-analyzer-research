@@ -206,6 +206,66 @@ def ask_claude(pdf_path: Path) -> dict:
     return {"status": "ok", "trap_risk": risk, "reason": str(out.get("reason", ""))[:300]}
 
 
+REVISION_PROMPT = (
+    "これは日本の上場会社の「業績予想の修正に関するお知らせ」の PDF です。"
+    "修正後の通期（今期）の「親会社株主に帰属する当期純利益」（なければ「当期純利益」）の予想値を読み取ってください。"
+    "単位（百万円・千円・円）に注意し、円に直してください。範囲で書かれていれば中央値、書かれていなければ null。"
+)
+
+
+def read_revision(pdf_path: Path) -> dict:
+    prompt = (REVISION_PROMPT + f"\n\nPDF：{pdf_path}\n次の JSON だけを1行で答えてください："
+              '{"np_forecast_yen": 数値または null}')
+    try:
+        run = subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--allowedTools", "Read",
+                              "--max-turns", "4"], capture_output=True, text=True, timeout=600)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return {"status": f"cli_{type(e).__name__}"}
+    if run.returncode != 0:
+        return {"status": "cli_error"}
+    try:
+        result = json.loads(run.stdout).get("result", "")
+        out = json.loads(re.search(r"\{[^{}]*\"np_forecast_yen\"[^{}]*\}", result).group(0))
+        v = out["np_forecast_yen"]
+        return {"status": "ok", "np_forecast": None if v is None else float(v)}
+    except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError):
+        return {"status": "bad_output"}
+
+
+def process_revisions() -> dict:
+    """Claude reads queued 業績予想の修正 PDFs and the new forecast is added to forward/fundamentals.csv."""
+    import csv as _csv
+
+    q = FD.REVISION_QUEUE
+    if not q.exists():
+        return {}
+    with q.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    counts = {}
+    for r in rows:
+        if r["status"] != "pending":
+            continue
+        resp = requests.get(FD.TDNET + r["pdf"], headers=FD.UA, timeout=60)
+        if resp.status_code != 200:
+            r["status"] = "pdf_not_found"
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"{r['code']}_{r['disc_no']}.pdf"
+                path.write_bytes(resp.content)
+                res = read_revision(path)
+            if res["status"] == "ok":
+                FD.add_revision(r["code"], r["disc_date"], r["disc_time"], r["disc_no"], res["np_forecast"])
+                r["status"] = "done" if res["np_forecast"] is not None else "no_value"
+            elif res["status"] == "bad_output":
+                r["status"] = "bad_output"
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    with q.open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=FD.REVISION_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    return counts
+
+
 def liquid_now(code: str) -> bool:
     f = FD.PRICES / f"{code}.csv"
     if not f.exists():
@@ -219,9 +279,10 @@ def score() -> None:
     if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         print(json.dumps({"skipped": "CLAUDE_CODE_OAUTH_TOKEN is not set"}))
         return
+    revisions = process_revisions()
     index = FWD / "tdnet_pdfs.csv"
     if not index.exists():
-        print(json.dumps({"scored": {}}))
+        print(json.dumps({"scored": {}, "revisions": revisions}, ensure_ascii=False))
         return
     done = set()
     if SCORE_FILE.exists():
@@ -254,7 +315,7 @@ def score() -> None:
         with SCORE_FILE.open("a") as out:
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
         done.add(r.disc_no)
-    print(json.dumps({"scored": counts}, ensure_ascii=False))
+    print(json.dumps({"scored": counts, "revisions": revisions}, ensure_ascii=False))
 
 
 def trap_risk(asof: pd.Timestamp) -> dict[str, int]:
