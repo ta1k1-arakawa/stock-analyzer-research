@@ -31,7 +31,7 @@ jobs:
 
     # 無料のデータ：株価は yfinance、決算データは TDnet（東証の適時開示）
     - name: Debug TDnet parsing (temporary)
-      run: python experiments/free_data.py debug-tdnet 2026-09-25
+      run: python experiments/free_data.py debug-tdnet 2026-09-25; exit 1
 
     - name: Update data
       run: python experiments/exp004_forward.py update-data
