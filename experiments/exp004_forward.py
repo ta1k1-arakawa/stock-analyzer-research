@@ -52,7 +52,8 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W")
+PORTFOLIOS = ("R", "M", "L", "W", "V")
+REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
 
 # ----------------------------------------------------------------------------
@@ -339,6 +340,19 @@ def rank_multiplier(rank: float) -> float:
     return float(np.clip(2.0 - rank / 20.0, 0.5, 1.5))
 
 
+def split_weights(name: str, buys: list[str], pend: dict) -> np.ndarray:
+    """How a tranche's cash is split between its new names: equal (R, M, L), by rank (W), by 1/volatility (V)."""
+    if name == "W":
+        ranks = pend.get("ranks", {})
+        return np.array([rank_multiplier(ranks.get(x, 20)) for x in buys])
+    if name == "V":
+        vol = pend.get("vol", {})
+        v = np.array([vol.get(x, np.nan) for x in buys], dtype=float)
+        if np.all(np.isfinite(v) & (v > 0)):
+            return 1.0 / v
+    return np.ones(len(buys))
+
+
 def load_state() -> dict:
     p = FWD / "state.json"
     if p.exists():
@@ -351,6 +365,10 @@ def load_state() -> dict:
                     for x in pend["orders"][k]:
                         pend["ranks"].setdefault(x, len(pend["ranks"]) + 1)
             state["W"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                          "pending": pend}
+        if "V" not in state:  # EXP-008: V starts with R's first orders
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["V"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                           "pending": pend}
         return state
     return {name: {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
@@ -401,7 +419,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 bought |= set(buys)
                 if buys:
                     ranks = pend.get("ranks", {})
-                    w = np.array([rank_multiplier(ranks.get(x, 20)) if name == "W" else 1.0 for x in buys])
+                    w = split_weights(name, buys, pend)
                     w = w / w.sum()
                     tr["holdings"] = {x: tr["cash"] * wx / (o.at[today, x] * (1 + COST)) for x, wx in zip(buys, w)}
                     tr["cash"] = 0.0
@@ -425,6 +443,8 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         risk = trap_risk(today)
         rank["L"] = rank["R"][[risk.get(x, 3) <= TRAP_MAX for x in rank["R"].index]]
         rank["W"] = rank["R"]
+        rank["V"] = rank["R"]
+        vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
         order = {x: i + 1 for i, x in enumerate(rank["R"].index)}
@@ -444,7 +464,9 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                                                                  pf["tranches"][k]["holdings"].items()) for k in due}
             pf["pending"] = {"decided_on": str(today.date()), "exec_date": str(nxt.date()), "orders": orders,
                              "tranche_value": tranche_value, "ranks": {x: v["rank"] for x, v in info.items()}}
-            if name in ("R", "W"):
+            pf["pending"]["vol"] = {x: round(float(vol60[x]), 6) for c in orders.values() for x in c
+                                    if np.isfinite(vol60.get(x, np.nan))}
+            if name in ("R", "W", "V"):
                 pf["pending"]["info"] = {x: info[x] for c in orders.values() for x in c if x in info}
         write_order_sheet(state, today, nxt, due)
 
@@ -469,7 +491,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（実運用：ルール）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
@@ -539,16 +561,17 @@ def slack_message(state: dict) -> dict:
     names_file = FWD / "names.json"
     names = json.loads(names_file.read_text()) if names_file.exists() else {}
     nm = lambda x: f"{x} {names.get(x, '')}".strip()  # noqa: E731
-    pf, pend = state["R"], state["R"]["pending"]
+    pf, pend = state[REAL], state[REAL]["pending"]
     sells, buys, spares, keeps = [], [], [], []
     for k, cands in pend["orders"].items():
         held = sorted(pf["tranches"][int(k)]["holdings"])
         new = cands[:PER_TRANCHE]
         value = pend.get("tranche_value", {}).get(k, BUDGET / N_TRANCHES)
-        per_stock = value / max(len(new), 1)
+        w = split_weights(REAL, new, pend)
+        w = w / w.sum() if len(new) else w
         keeps += [x for x in held if x in new]
         sells += [x for x in held if x not in new]
-        buys += [(x, per_stock) for x in new if x not in held]
+        buys += [(x, value * wx) for x, wx in zip(new, w) if x not in held]
         spares += cands[PER_TRANCHE:]
     taken = {x for x, _ in buys} | set(keeps) | {x for t in pf["tranches"] for x in t["holdings"]}
     spares = [x for x in dict.fromkeys(spares) if x not in taken]
@@ -566,18 +589,24 @@ def slack_message(state: dict) -> dict:
             i = info.get(x)
             if not i:
                 return ""
-            price = f"財産の{i['pbr'] * 10:.0f}割の値段" if i["pbr"] < 1 else f"財産の{i['pbr']:.1f}倍の値段"
-            return (f"\n　　候補{i['n']}社中 *{i['rank']}位*｜PBR {i['pbr']:.2f}倍（{price}）"
+            price = f"財産の{i['pbr'] * 10:.1f}割の値段" if i["pbr"] < 1 else f"財産の{i['pbr']:.1f}倍の値段"
+            line = (f"\n　　候補{i['n']}社中 *{i['rank']}位*｜PBR {i['pbr']:.2f}倍（{price}）"
                     f"｜予想ROE {i['roe']:.1%}（財産100円で年{i['roe'] * 100:.0f}円稼ぐ見込み）")
-        buy_txt = "\n".join(f"• *{nm(x)}*　約{int(round(v, -3)):,}円{why(x)}" for x, v in buys) or "なし"
+            v = pend.get("vol", {}).get(x)
+            if v:
+                feel = "荒いので少なめ" if v > 0.028 else ("穏やかなので多め" if v < 0.018 else "ふつう")
+                line += f"\n　　金額の理由：1日の値動きが平均 ±{v * 100:.1f}%（{feel}）"
+            return line
+        buy_lines = [f"• *{nm(x)}*　約{int(round(v, -3)):,}円{why(x)}" for x, v in buys]
         if sells:
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                                                         "text": f":outbox_tray: *売る*（持っている全株）\n{sell_txt}"}})
-        if buys:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                                                        "text": f":inbox_tray: *買う*（金額は40万円で運用する場合の目安）\n{buy_txt}"}})
+        for n0 in range(0, len(buy_lines), 6):  # Slack allows 3,000 characters per section
+            head = ":inbox_tray: *買う*（金額は40万円で運用する場合の目安）\n" if n0 == 0 else ""
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": head + "\n".join(buy_lines[n0:n0 + 6])}})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
-                       "点数＝割安さ（PBR が低いほど高い）の順位＋稼ぐ力（予想ROE が高いほど高い）の順位。上位ほど「安くて稼ぐ会社」"}]})
+                       "選び方：割安さ（PBR が低いほど高い）の順位＋稼ぐ力（予想ROE が高いほど高い）の順位が高い会社。"
+                       "金額：値動きが荒い会社は少なめ、穏やかな会社は多め（2社で組の資金を分ける）"}]})
         if spares:
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
                            "寄付で買えなかった銘柄があれば、代わりに上から順に：" + "、".join(nm(x) for x in spares[:4])}]})
@@ -587,13 +616,13 @@ def slack_message(state: dict) -> dict:
     ledger = FWD / "ledger.csv"
     if ledger.exists():
         led = pd.read_csv(ledger)
-        r = led[(led.portfolio == "R") & (pd.to_datetime(led.date) >= START)]
+        r = led[(led.portfolio == REAL) & (pd.to_datetime(led.date) >= START)]
         if len(r):
-            first = led[(led.portfolio == "R")].iloc[0]
+            first = led[(led.portfolio == REAL)].iloc[0] if (led.portfolio == REAL).any() else r.iloc[0]
             gain = r["value"].iloc[-1] / BUDGET - 1
             tpx = r["topix_close"].iloc[-1] / first["topix_close"] - 1
             blocks += [{"type": "divider"}, {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*ルール（R）の成績*\n{gain:+.1%}"},
+                {"type": "mrkdwn", "text": f"*実運用（V）の成績*\n{gain:+.1%}"},
                 {"type": "mrkdwn", "text": f"*TOPIX（同じ期間）*\n{tpx:+.1%}"}]}]
     return {"text": f"{title}：売る {len(sells)}銘柄・買う {len(buys)}銘柄",
             "blocks": blocks}
@@ -603,7 +632,7 @@ def notify() -> None:
     """Send the real-money (R) orders to Slack, once per order sheet (FORCE_NOTIFY=1 to resend)."""
     url = os.environ.get("SLACK_WEBHOOK_URL")
     state = load_state()
-    pend = state["R"]["pending"]
+    pend = state[REAL]["pending"]
     force = os.environ.get("FORCE_NOTIFY") == "1"
     if not url or not pend or (state.get("notified") == pend["exec_date"] and not force):
         print(json.dumps({"notified": False}))
