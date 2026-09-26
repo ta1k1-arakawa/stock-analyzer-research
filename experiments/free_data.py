@@ -171,16 +171,19 @@ def update_fundamentals(codes: list[str], days: int = 7) -> dict:
     rows = read_fund()
     seen = {(r["code"], r["disc_no"]) for r in rows}
     universe = set(codes)
-    added, failed = 0, []
+    added, failed, stats = 0, [], {"tdnet_rows": 0, "universe_docs": 0, "already_known": 0}
     today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
     for back in range(days):
         day = today - pd.Timedelta(days=back)
         for d in list_rows(day):
+            stats["tdnet_rows"] += 1
             kind = doc_kind(d["title"])
             if d["code"] not in universe or not kind or not d["xbrl"]:
                 continue
+            stats["universe_docs"] += 1
             disc_no = re.sub(r"\D", "", d["xbrl"])[-14:]
             if (d["code"], disc_no) in seen:
+                stats["already_known"] += 1
                 continue
             try:
                 z = zipfile.ZipFile(io.BytesIO(requests.get(TDNET + d["xbrl"], headers=UA, timeout=60).content))
@@ -213,7 +216,7 @@ def update_fundamentals(codes: list[str], days: int = 7) -> dict:
         w = csv.DictWriter(f, fieldnames=FUND_FIELDS)
         w.writeheader()
         w.writerows(rows)
-    return {"added": added, "failed": failed}
+    return {"added": added, "failed": failed, **stats}
 
 
 # ----------------------------------------------------------------------------
