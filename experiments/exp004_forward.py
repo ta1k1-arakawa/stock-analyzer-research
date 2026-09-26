@@ -416,7 +416,10 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 pool = [x for x in rank[name].index if x not in others and x not in taken]
                 orders[str(k)] = pool[:PER_TRANCHE + SPARE]
                 taken |= set(pool[:PER_TRANCHE])
-            pf["pending"] = {"decided_on": str(today.date()), "exec_date": str(nxt.date()), "orders": orders}
+            tranche_value = {str(k): pf["tranches"][k]["cash"] + sum(sh * c.at[today, x] for x, sh in
+                                                                 pf["tranches"][k]["holdings"].items()) for k in due}
+            pf["pending"] = {"decided_on": str(today.date()), "exec_date": str(nxt.date()), "orders": orders,
+                             "tranche_value": tranche_value}
         write_order_sheet(state, today, nxt, due)
 
     state["last_step"] = str(today.date())
@@ -497,21 +500,82 @@ def eval_l() -> None:
     print(json.dumps(out, ensure_ascii=False))
 
 
+WEEKDAY = "月火水木金土日"
+
+
+def jp_date(d: str) -> str:
+    t = pd.Timestamp(d)
+    return f"{t.month}/{t.day}（{WEEKDAY[t.weekday()]}）"
+
+
+def slack_message(state: dict) -> dict:
+    """Block Kit message for the real-money portfolio R (Slack has no tables; use sections and lists)."""
+    names_file = FWD / "names.json"
+    names = json.loads(names_file.read_text()) if names_file.exists() else {}
+    nm = lambda x: f"{x} {names.get(x, '')}".strip()  # noqa: E731
+    pf, pend = state["R"], state["R"]["pending"]
+    sells, buys, spares, keeps = [], [], [], []
+    for k, cands in pend["orders"].items():
+        held = sorted(pf["tranches"][int(k)]["holdings"])
+        new = cands[:PER_TRANCHE]
+        value = pend.get("tranche_value", {}).get(k, BUDGET / N_TRANCHES)
+        per_stock = value / max(len(new), 1)
+        keeps += [x for x in held if x in new]
+        sells += [x for x in held if x not in new]
+        buys += [(x, per_stock) for x in new if x not in held]
+        spares += cands[PER_TRANCHE:]
+    taken = {x for x, _ in buys} | set(keeps) | {x for t in pf["tranches"] for x in t["holdings"]}
+    spares = [x for x in dict.fromkeys(spares) if x not in taken]
+    title = f"{jp_date(pend['exec_date'])} 朝の注文"
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": title}},
+              {"type": "context", "elements": [{"type": "mrkdwn", "text":
+               f"{jp_date(pend['decided_on'])}の終値で決定　・　すべて *寄成*（寄付の成行）　・　S株でOK"}]}]
+    if not sells and not buys:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*今日は売買なし* :white_check_mark:\n入れ替えの日ですが、選ばれた銘柄が今と同じでした。"}})
+    else:
+        sell_txt = "\n".join(f"• {nm(x)}" for x in sells) or "なし"
+        buy_txt = "\n".join(f"• {nm(x)}　_約{int(round(v, -3)):,}円_" for x, v in buys) or "なし"
+        if sells:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                                                        "text": f":outbox_tray: *売る*（持っている全株）\n{sell_txt}"}})
+        if buys:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                                                        "text": f":inbox_tray: *買う*（金額は40万円で運用する場合の目安）\n{buy_txt}"}})
+        if spares:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+                           "寄付で買えなかった銘柄があれば、代わりに上から順に：" + "、".join(nm(x) for x in spares[:4])}]})
+    if keeps:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+                       "そのまま持ち続ける：" + "、".join(nm(x) for x in keeps)}]})
+    ledger = FWD / "ledger.csv"
+    if ledger.exists():
+        led = pd.read_csv(ledger)
+        r = led[(led.portfolio == "R") & (pd.to_datetime(led.date) >= START)]
+        if len(r):
+            first = led[(led.portfolio == "R")].iloc[0]
+            gain = r["value"].iloc[-1] / BUDGET - 1
+            tpx = r["topix_close"].iloc[-1] / first["topix_close"] - 1
+            blocks += [{"type": "divider"}, {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*ルール（R）の成績*\n{gain:+.1%}"},
+                {"type": "mrkdwn", "text": f"*TOPIX（同じ期間）*\n{tpx:+.1%}"}]}]
+    return {"text": f"{title}：売る {len(sells)}銘柄・買う {len(buys)}銘柄",
+            "blocks": blocks}
+
+
 def notify() -> None:
-    """Send the real-money (R) part of tomorrow's order sheet to Slack, once per sheet."""
+    """Send the real-money (R) orders to Slack, once per order sheet (FORCE_NOTIFY=1 to resend)."""
     url = os.environ.get("SLACK_WEBHOOK_URL")
     state = load_state()
     pend = state["R"]["pending"]
-    if not url or not pend or state.get("notified") == pend["exec_date"]:
+    force = os.environ.get("FORCE_NOTIFY") == "1"
+    if not url or not pend or (state.get("notified") == pend["exec_date"] and not force):
         print(json.dumps({"notified": False}))
         return
-    sheet = (FWD / "orders" / f"{pend['exec_date']}.md").read_text()
-    r_part = sheet.split("## M")[0].strip()
-    r = requests.post(url, json={"text": r_part + "\n\n（EXP-004 前向き検証。同じ銘柄は売買不要）"}, timeout=10)
+    r = requests.post(url, json=slack_message(state), timeout=10)
     if r.status_code == 200:
         state["notified"] = pend["exec_date"]
         (FWD / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=1) + "\n")
-    print(json.dumps({"notified": r.status_code == 200}))
+    print(json.dumps({"notified": r.status_code == 200, "detail": r.text[:200]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

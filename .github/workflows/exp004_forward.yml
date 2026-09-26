@@ -5,6 +5,11 @@ on:
   schedule:
     - cron: '0 10 * * 1-5'
   workflow_dispatch:
+    inputs:
+      resend:
+        description: '同じ注文を Slack にもう一度送る'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -48,6 +53,7 @@ jobs:
     - name: Send R's orders to Slack
       env:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        FORCE_NOTIFY: ${{ inputs.resend && '1' || '0' }}
       run: python experiments/exp004_forward.py notify
 
     - name: Commit forward records
