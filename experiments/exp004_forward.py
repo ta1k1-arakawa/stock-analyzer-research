@@ -52,7 +52,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L")
+PORTFOLIOS = ("R", "M", "L", "W")
 
 
 # ----------------------------------------------------------------------------
@@ -334,10 +334,25 @@ def trap_risk(asof: pd.Timestamp) -> dict[str, int]:
 # paper portfolios
 # ----------------------------------------------------------------------------
 
+def rank_multiplier(rank: float) -> float:
+    """EXP-007 W: 1-10th 1.5x, 20th 1.0x, 30th and below 0.5x."""
+    return float(np.clip(2.0 - rank / 20.0, 0.5, 1.5))
+
+
 def load_state() -> dict:
     p = FWD / "state.json"
     if p.exists():
-        return json.loads(p.read_text())
+        state = json.loads(p.read_text())
+        if "W" not in state:  # EXP-007: W starts with R's first orders (initial picks are ranks 1, 2, 3, ...)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            if pend and "ranks" not in pend:
+                pend["ranks"] = {}
+                for k in sorted(pend["orders"], key=int):
+                    for x in pend["orders"][k]:
+                        pend["ranks"].setdefault(x, len(pend["ranks"]) + 1)
+            state["W"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                          "pending": pend}
+        return state
     return {name: {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                    "pending": None} for name in PORTFOLIOS} | {"last_step": None}
 
@@ -385,8 +400,10 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 buys = [x for x in cands if o.at[today, x] > 0 and x not in bought][:PER_TRANCHE]
                 bought |= set(buys)
                 if buys:
-                    alloc = tr["cash"] / len(buys)
-                    tr["holdings"] = {x: alloc / (o.at[today, x] * (1 + COST)) for x in buys}
+                    ranks = pend.get("ranks", {})
+                    w = np.array([rank_multiplier(ranks.get(x, 20)) if name == "W" else 1.0 for x in buys])
+                    w = w / w.sum()
+                    tr["holdings"] = {x: tr["cash"] * wx / (o.at[today, x] * (1 + COST)) for x, wx in zip(buys, w)}
                     tr["cash"] = 0.0
             pf["pending"] = None
         elif pend and pd.Timestamp(pend["exec_date"]) < today:
@@ -407,6 +424,13 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         }
         risk = trap_risk(today)
         rank["L"] = rank["R"][[risk.get(x, 3) <= TRAP_MAX for x in rank["R"].index]]
+        rank["W"] = rank["R"]
+        eq, npf = E3.fundamentals(fins, dates)
+        mcap = panel["MktCap"].loc[today] * 1e6
+        order = {x: i + 1 for i, x in enumerate(rank["R"].index)}
+        info = {x: {"rank": order[x], "n": len(order),
+                    "pbr": round(float(mcap[x] / eq.at[today, x]), 2),
+                    "roe": round(float(npf.at[today, x] / eq.at[today, x]), 4)} for x in rank["R"].index[:80]}
         for name in PORTFOLIOS:
             pf = state[name]
             # names kept by tranches that do not trade tomorrow, plus names given to earlier due tranches
@@ -419,7 +443,9 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             tranche_value = {str(k): pf["tranches"][k]["cash"] + sum(sh * c.at[today, x] for x, sh in
                                                                  pf["tranches"][k]["holdings"].items()) for k in due}
             pf["pending"] = {"decided_on": str(today.date()), "exec_date": str(nxt.date()), "orders": orders,
-                             "tranche_value": tranche_value}
+                             "tranche_value": tranche_value, "ranks": {x: v["rank"] for x, v in info.items()}}
+            if name in ("R", "W"):
+                pf["pending"]["info"] = {x: info[x] for c in orders.values() for x in c if x in info}
         write_order_sheet(state, today, nxt, due)
 
     state["last_step"] = str(today.date())
@@ -443,7 +469,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（実運用：ルール）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）"}[name]
+        title = {"R": "R（実運用：ルール）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
@@ -534,13 +560,24 @@ def slack_message(state: dict) -> dict:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*今日は売買なし* :white_check_mark:\n入れ替えの日ですが、選ばれた銘柄が今と同じでした。"}})
     else:
         sell_txt = "\n".join(f"• {nm(x)}" for x in sells) or "なし"
-        buy_txt = "\n".join(f"• {nm(x)}　_約{int(round(v, -3)):,}円_" for x, v in buys) or "なし"
+        info = pend.get("info", {})
+
+        def why(x: str) -> str:
+            i = info.get(x)
+            if not i:
+                return ""
+            price = f"財産の{i['pbr'] * 10:.0f}割の値段" if i["pbr"] < 1 else f"財産の{i['pbr']:.1f}倍の値段"
+            return (f"\n　　候補{i['n']}社中 *{i['rank']}位*｜PBR {i['pbr']:.2f}倍（{price}）"
+                    f"｜予想ROE {i['roe']:.1%}（財産100円で年{i['roe'] * 100:.0f}円稼ぐ見込み）")
+        buy_txt = "\n".join(f"• *{nm(x)}*　約{int(round(v, -3)):,}円{why(x)}" for x, v in buys) or "なし"
         if sells:
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                                                         "text": f":outbox_tray: *売る*（持っている全株）\n{sell_txt}"}})
         if buys:
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                                                         "text": f":inbox_tray: *買う*（金額は40万円で運用する場合の目安）\n{buy_txt}"}})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+                       "点数＝割安さ（PBR が低いほど高い）の順位＋稼ぐ力（予想ROE が高いほど高い）の順位。上位ほど「安くて稼ぐ会社」"}]})
         if spares:
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
                            "寄付で買えなかった銘柄があれば、代わりに上から順に：" + "、".join(nm(x) for x in spares[:4])}]})
