@@ -16,7 +16,7 @@ This runbook is mandatory whenever a task can reach any of the following:
 - direct Windows PowerShell prepared for any of the above.
 
 It applies to the task author, ChatGPT, GPT-5.6 Sol, Codex, Claude Code
-Cloud, and reviewers when they prepare, inspect, authorize, execute, or
+(local or Cloud), and reviewers when they prepare, inspect, authorize, execute, or
 report an in-scope operation.
 
 ## Authority and boundary
@@ -205,15 +205,20 @@ and helper functions.
 ## 7. Execution environment
 
 For real network, private-data, human-gated, or durable-machine-state
-execution, default to direct Windows PowerShell. Claude Code Cloud and
-Codex may prepare and statically inspect the command, but execution must not
+execution, default to direct Windows PowerShell. Claude Code (local or
+Cloud) and Codex may prepare and statically inspect the command, but execution must not
 depend on the lifetime of an AI-agent session. Long or one-shot work must be
 prepared so it can continue on the Windows side after an SSH or agent
 connection ends, when the frozen design permits that topology.
 
-Local Claude Code remains prohibited by repository governance. Normal local
-Codex editing and short validation are separate from direct execution and do
-not authorize a private or network boundary.
+By project policy, local Claude Code and local Codex may both perform
+ordinary repository-writing work (editing, short validation, commit/push)
+per `AI_RESEARCH_EXECUTION_RULES.md` §1.4. That ordinary work is separate
+from direct execution and does not authorize a private, network,
+human-gated, durable-state, or one-shot boundary. Where this runbook
+requires it, protected execution is performed by the human through a
+reviewed Direct-Windows PowerShell command and must not depend on a Claude
+or Codex agent session remaining alive.
 
 ### 7a. Active protected-environment authority resolution
 

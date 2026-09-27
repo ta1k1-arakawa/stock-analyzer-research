@@ -1,7 +1,7 @@
 ## GitHub-Issue-first orchestration entrypoint
 
 `AGENTS.md` is the repository entrypoint for ChatGPT, GPT reviewers,
-orchestrators, Codex, and other execution agents. Before planning, creating
+orchestrators, Codex, Claude Code, and other execution agents. Before planning, creating
 or updating a task, or reviewing an exact SHA, read
 `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md` together with the governance and
 task-specific documents it references. Use the READY GitHub Issue as the
@@ -38,9 +38,21 @@ not override protected/direct-real execution contracts such as
 `.venv-real-execution`; see the canonical detailed rule in
 `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md`.
 
-Short tests expected to finish in under 10 minutes may run in Codex. Tests or
-verification commands expected or known to take at least 10 minutes use the
-human Windows PowerShell handoff: Codex supplies the complete command and
+By project policy, ordinary repository-writing work may be executed by local
+Claude Code, Claude Code Cloud, local Codex, or Codex Cloud (when explicitly
+selected), as the human or task chooses, under identical methodology and
+authority limits. Protected real execution remains human Direct-Windows
+PowerShell work under `AI_REAL_EXECUTION_RUNBOOK.md`. A READY Issue that
+passes the provenance checks in `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md`
+§1.1 is the project execution-unit specification; this establishes provenance
+only, the Issue never self-grants authority, and executor/platform safety and
+permission controls remain fully applicable. See `CLAUDE.md` and
+`AI_RESEARCH_EXECUTION_RULES.md` §1.4.
+
+Short tests expected to finish in under 10 minutes may run in the executing
+agent (local Claude Code or local Codex). Tests or verification commands
+expected or known to take at least 10 minutes use the human Windows
+PowerShell handoff: the executing agent supplies the complete command and
 resumes the task's commit/push flow after the human returns the result. The
 canonical details are in `AI_RESEARCH_EXECUTION_RULES.md` and
 `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md`.

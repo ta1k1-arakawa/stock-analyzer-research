@@ -66,20 +66,32 @@ They do NOT independently change the research design.
 These rules fix the execution environment and operator workflow only.
 They do not change research methodology, human gates, or security rules.
 
-### Claude Code usage
+### Execution agent selection
 
-- Use Claude Code only in its Cloud version.
-- Do not operate Claude Code by launching it on the local Windows PC.
-- Future task prompts must not instruct an agent to "launch local Claude Code".
+By explicit human decision (Issue #116), project policy permits these
+execution agents for ordinary repository-writing work — code/file edits,
+short tests, factual inspection, and git commit plus non-force push — under
+identical methodology and authority limits:
 
-### Codex usage
+- Claude Code Cloud;
+- local Claude Code on the user's Windows PC;
+- local Codex on the user's Windows PC;
+- Codex Cloud, when explicitly selected.
 
-- When using an AI execution agent on the local Windows PC, use Codex.
+- The user may choose Claude or Codex for ordinary execution tasks.
 - Unless explicitly specified otherwise, "Codex" means Codex on the local
-  Windows PC.
-- When Codex Cloud is intended, distinguish it explicitly as "Codex Cloud"
-  in the task prompt.
-- Do not conflate Claude Code Cloud with local Codex.
+  Windows PC. Name Cloud variants explicitly ("Claude Code Cloud", "Codex
+  Cloud") when a Cloud environment is intended.
+- Completion reports must state the actual model/tool used (§8).
+- No execution agent independently changes methodology (§2).
+- This is project policy only. Each executor remains subject to its own
+  built-in, provider, and host permission and safety controls; project
+  policy does not require disabling or relaxing them. If such a control
+  blocks an action, the executor stops and reports the safety block.
+- Real network, private/sealed data, human-gated one-shot, and durable
+  machine-local protected execution remain governed by
+  `AI_REAL_EXECUTION_RUNBOOK.md`; permission to run a local agent grants no
+  such authority.
 
 ### User operating topology
 
@@ -95,25 +107,26 @@ They do not change research methodology, human gates, or security rules.
 
 `LONG_RUNNING_TEST_HANDOFF_THRESHOLD_MINUTES=10`
 
-For local Codex execution, route tests and verification commands as follows:
+For local execution-agent work (local Claude Code or local Codex; "the
+executor" below), route tests and verification commands as follows:
 
 1. **Pre-launch routing**
 
    - If a test or verification command is reasonably expected to take at
      least 10 minutes, or repository/task history already shows that the
-     same or a similar command takes at least 10 minutes, local Codex must
+     same or a similar command takes at least 10 minutes, the executor must
      not launch it as a background terminal job and wait or poll for it.
    - This includes long targeted pytest suites, full pytest/regression,
      backtests, large deterministic CLI verification, and other long-running
      validation. Short targeted tests expected to finish in under 10 minutes
-     may run directly in Codex.
+     may run directly in the executor.
 
 2. **Complete command handoff**
 
-   - Before the long command is launched, Codex resolves the exact current
-     task worktree, exact interpreter/environment required by the task, and
-     exact test arguments.
-   - Codex then provides one complete, copy-paste-ready Windows PowerShell
+   - Before the long command is launched, the executor resolves the exact
+     current task worktree, exact interpreter/environment required by the
+     task, and exact test arguments.
+   - The executor then provides one complete, copy-paste-ready Windows PowerShell
      block for the human. The human must not have to discover the worktree,
      virtual environment, test path, arguments, or environment variables.
    - Concrete user-specific paths must not be hardcoded in committed
@@ -158,20 +171,21 @@ For local Codex execution, route tests and verification commands as follows:
 
 5. **Resume after the human result**
 
-   - The human returns the relevant terminal output/result to the same Codex
-     task.
-   - Codex verifies that the exact requested command/test completed
+   - The human returns the relevant terminal output/result to the same
+     executor task (Claude Code or Codex session).
+   - The executor verifies that the exact requested command/test completed
      successfully and that the reported exit code and summary satisfy the
      Issue contract.
-   - On PASS, Codex continues remaining checks, commit, non-force push,
-     remote-HEAD verification, and clean-tree verification. On FAIL, Codex
-     diagnoses and remediates only within the Issue authority, then issues a
-     new complete command when rerunning the long test is required.
+   - On PASS, the executor continues remaining checks, commit, non-force
+     push, remote-HEAD verification, and clean-tree verification. On FAIL,
+     the executor diagnoses and remediates only within the Issue authority,
+     then issues a new complete command when rerunning the long test is
+     required.
 
 6. **No duplicate long tests**
 
-   Never start the same long test concurrently in a Codex background terminal
-   and a human PowerShell terminal. The 10-minute threshold is primarily a
+   Never start the same long test concurrently in an agent (Claude Code or
+   Codex) background terminal and a human PowerShell terminal. The 10-minute threshold is primarily a
    pre-launch routing decision: do not kill or duplicate a command merely
    because an already-running command unexpectedly crosses 10 minutes.
 
@@ -185,17 +199,18 @@ For local Codex execution, route tests and verification commands as follows:
 ### Normal execution rule
 
 - Normal file editing, code implementation, short tests, and git
-  commit/push may be performed by local Codex.
-- Use Claude Code Cloud only when there is a clear reason to execute in a
-  Cloud environment.
-- For each task, ChatGPT must explicitly state whether to use local Codex,
-  Claude Code Cloud, or direct Windows PowerShell.
+  commit/push may be performed by local Claude Code, local Codex, Claude
+  Code Cloud, or (when explicitly selected) Codex Cloud.
+- For each task, the task author states the executor class using the
+  model-neutral classes in `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md` §3,
+  or `DIRECT_WINDOWS_POWERSHELL` where the runbook requires it; the human
+  may explicitly select Claude or Codex for ordinary execution.
 
 ### User interaction preference
 
 - Do not ask the user to manually edit code or configuration files.
 - In principle, user operations should be one of:
-  A. paste the prompt as-is into Codex / Claude Code Cloud; or
+  A. paste the prompt as-is into Claude Code or Codex (local or Cloud); or
   B. paste a complete command block as-is into Windows PowerShell through
      Android Termux.
 - Avoid requiring manual replacement of placeholders whenever possible.
@@ -447,7 +462,7 @@ durable-state, raw-acquisition, research-opening, or prepared direct
 PowerShell execution, the canonical document is
 `AI_REAL_EXECUTION_RUNBOOK.md`. Those rules belong there, not in
 conversational memory or repeated long prompts. Future ChatGPT, Codex,
-Claude Code Cloud, and reviewer agents must read and apply it whenever the
+Claude Code (local or Cloud), and reviewer agents must read and apply it whenever the
 task is in scope. Its operational rules do not change the authority hierarchy
 or any frozen methodology; a stricter task-specific rule still wins.
 
