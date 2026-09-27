@@ -17,17 +17,23 @@ not stop merely after local edits, static checks, or saying that files are
 "ready to commit/push." See
 `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md` for the canonical detailed rule.
 
-GitHub/Codex Start-button tasks may begin in a generated task branch or
-worktree whose name or base differs from the authoritative branch. For
-ordinary repository-writing tasks, handle that condition only through the
-`CODEX_MANAGED_TASK_WORKSPACE` procedure in
-`AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md`; it is not by itself a branch-
-mismatch STOP. Protected/direct-real-execution tasks remain subject to their
-stricter rules.
+Any execution agent (local Claude Code, local Codex, or their Cloud
+variants) may begin an ordinary task in a generated task branch/worktree, a
+detached worktree, or its own worktree while the authoritative branch is
+already checked out elsewhere. For ordinary repository-writing tasks, handle
+that condition only through the model-neutral `MANAGED_TASK_WORKSPACE`
+procedure in `AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md` §5 (legacy alias:
+`CODEX_MANAGED_TASK_WORKSPACE`); it is not by itself a branch-mismatch STOP.
+Realign only the executing worktree and never mutate another worktree's
+checked-out authoritative branch. When the §5 preconditions pass
+mechanically, proceed without asking the human to choose among equivalent
+workspace strategies (§5.2); built-in agent/platform permission prompts and
+safety controls still apply. Protected/direct-real-execution tasks remain
+subject to their stricter rules and never use this mode.
 
-For ordinary Python development/test tasks in a generated Orca/Codex
-worktree, do not assume ignored or untracked environments such as `.venv`
-exist there. If environment mutation is not authorized, discover existing
+For ordinary Python development/test tasks in a generated or managed agent
+task worktree (Orca, Claude Code, or Codex), do not assume ignored or
+untracked environments such as `.venv` exist there. If environment mutation is not authorized, discover existing
 Git worktree roots read-only and probe each `<worktree>\.venv\Scripts\python.exe`
 for the required imports/version before invoking it explicitly. Do not
 create, copy, repair, install, upgrade, uninstall, or otherwise mutate an

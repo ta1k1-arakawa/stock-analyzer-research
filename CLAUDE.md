@@ -27,6 +27,19 @@ limits (`AI_RESEARCH_EXECUTION_RULES.md` §1.4). Protected real execution
 machine-local state) remains reviewed human Direct-Windows PowerShell work
 under `AI_REAL_EXECUTION_RUNBOOK.md`. Report the actual model/tool used.
 
+## Managed task workspace (ordinary tasks)
+
+If the current ordinary task worktree is detached, is on a generated task
+branch, or the authoritative branch is already checked out in another
+worktree, follow the model-neutral `MANAGED_TASK_WORKSPACE` procedure in
+`AI_GITHUB_ISSUE_ORCHESTRATION_WORKFLOW.md` §5. Do not invent a separate
+checkout/reset strategy, do not mutate another worktree, and do not treat
+the branch mismatch alone as an automatic STOP. When the §5 preconditions
+pass mechanically, proceed without asking the human to choose among
+equivalent workspace strategies (§5.2); Claude Code permission prompts and
+safety controls still apply. This mode never covers protected/direct-real
+execution.
+
 ## Verified READY Issue provenance
 
 When the user dispatches `GITHUB_ISSUE=<n>` or a GitHub Issue URL for
