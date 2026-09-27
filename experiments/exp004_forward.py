@@ -52,7 +52,8 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S")
+SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
 
@@ -366,6 +367,10 @@ def load_state() -> dict:
                         pend["ranks"].setdefault(x, len(pend["ranks"]) + 1)
             state["W"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                           "pending": pend}
+        if "S" not in state:  # EXP-009: S = R's longs plus shorts of the bottom names (starts with R's first long orders)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["S"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                          "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["V"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
@@ -423,10 +428,25 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                     w = w / w.sum()
                     tr["holdings"] = {x: tr["cash"] * wx / (o.at[today, x] * (1 + COST)) for x, wx in zip(buys, w)}
                     tr["cash"] = 0.0
+            if "shorts" in pf and "short_orders" in pend:
+                held_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if str(m) not in pend["short_orders"]))
+                for k_str, cands in pend["short_orders"].items():
+                    book = pf["shorts"][int(k_str)]
+                    for code, (p0, n) in book.items():
+                        px = (o.at[today, code] if o.at[today, code] > 0 else c[code].loc[:today].iloc[-2]) * (1 + COST)
+                        pf["realized"] += n * (1 - px / p0)
+                    new_s = [x for x in cands if o.at[today, x] > 0 and x not in held_s][:PER_TRANCHE]
+                    held_s |= set(new_s)
+                    notional = pend["equity"] * SHORT_FRAC / N_TRANCHES
+                    pf["shorts"][int(k_str)] = {x: [float(o.at[today, x] * (1 - COST)), notional / len(new_s)]
+                                                for x in new_s} if new_s else {}
             pf["pending"] = None
         elif pend and pd.Timestamp(pend["exec_date"]) < today:
             raise SystemExit(f"{name}: pending orders for {pend['exec_date']} were never executed (missed a day?)")
         value = sum(t["cash"] + sum(sh * c.at[today, x] for x, sh in t["holdings"].items()) for t in pf["tranches"])
+        if "shorts" in pf:
+            pf["realized"] -= sum(n for b in pf["shorts"] for _, n in b.values()) * SHORT_CARRY / 245
+            value += pf["realized"] + sum(n * (1 - c.at[today, x] / p0) for b in pf["shorts"] for x, (p0, n) in b.items())
         ledger_rows.append((name, value, sum(len(t["holdings"]) for t in pf["tranches"])))
 
     nxt = next_trading_day(today)
@@ -444,6 +464,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         rank["L"] = rank["R"][[risk.get(x, 3) <= TRAP_MAX for x in rank["R"].index]]
         rank["W"] = rank["R"]
         rank["V"] = rank["R"]
+        rank["S"] = rank["R"]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -468,6 +489,15 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                                     if np.isfinite(vol60.get(x, np.nan))}
             if name in ("R", "W", "V"):
                 pf["pending"]["info"] = {x: info[x] for c in orders.values() for x in c if x in info}
+            if "shorts" in pf:
+                others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
+                sorders, taken_s = {}, set()
+                for k in due:
+                    pool = [x for x in rank["R"].index[::-1] if x not in others_s and x not in taken_s]
+                    sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
+                    taken_s |= set(pool[:PER_TRANCHE])
+                pf["pending"]["short_orders"] = sorders
+                pf["pending"]["equity"] = next(v for n, v, _ in ledger_rows if n == name)
         write_order_sheet(state, today, nxt, due)
 
     state["last_step"] = str(today.date())
@@ -491,7 +521,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
