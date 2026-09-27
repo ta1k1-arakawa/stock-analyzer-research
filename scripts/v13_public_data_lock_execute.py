@@ -19,7 +19,7 @@ from src import v13_public_data_lock as pipeline
 
 STUDY = "V13_CONDITIONAL_CROSS_SECTIONAL_SHORT_HORIZON"
 OPERATION_SCHEMA = "V13_PUBLIC_DATALOCK_OPERATION_V1"
-SAFE_SCHEMA = "V13_PUBLIC_DATALOCK_SAFE_MANIFEST_V1"
+SAFE_SCHEMA = "V13_PUBLIC_DATALOCK_SAFE_MANIFEST_V2"
 
 
 class _OfficialLinks(HTMLParser):
@@ -156,6 +156,10 @@ def execute(*, t1_state: Path, v4_csv: Path, calendar_lock: Path,
     _bound_json(output / "selected.private.json", {"selected": selected})
     price_manifests = []
     omitted_observations = 0
+    omitted_payloads = 0
+    invalid_high_rows = 0
+    invalid_low_rows = 0
+    invalid_both_rows = 0
     tokyo = ZoneInfo("Asia/Tokyo")
     period1 = int(datetime(2015, 1, 1, tzinfo=tokyo).timestamp())
     period2 = int(datetime(2026, 1, 1, tzinfo=tokyo).timestamp())
@@ -165,10 +169,14 @@ def execute(*, t1_state: Path, v4_csv: Path, calendar_lock: Path,
     for code in selected:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.T?{params}"
         lock = _raw(url, output / f"yahoo-{code}.raw", fetch)
-        rows, manifest = pipeline.parse_yahoo(lock, code, omit_close_above_high=True)
-        omitted_observations += manifest["omitted_close_above_high_count"]
-        if omitted_observations > 1:
-            raise ValueError("YAHOO_CLOSE_ABOVE_HIGH_OMISSION_LIMIT")
+        rows, manifest = pipeline.parse_yahoo(
+            lock, code, omit_provider_invalid_ohlc_ordering=True)
+        omitted = manifest["omitted_provider_invalid_ohlc_ordering_count"]
+        omitted_observations += omitted
+        omitted_payloads += int(omitted > 0)
+        invalid_high_rows += manifest["provider_invalid_high_order_row_count"]
+        invalid_low_rows += manifest["provider_invalid_low_order_row_count"]
+        invalid_both_rows += manifest["provider_invalid_both_order_row_count"]
         _bound_json(output / f"price-{code}.private.json",
                     {day.isoformat(): row for day, row in rows.items()})
         price_manifests.append(manifest)
@@ -185,6 +193,11 @@ def execute(*, t1_state: Path, v4_csv: Path, calendar_lock: Path,
             "exclusions": exclusion_manifest, "universe": safe_universe,
             "calendar": safe_calendar, "yahoo_payload_count": len(price_manifests),
             "yahoo_raw_set_sha256": pipeline.digest(json.dumps(price_manifests, sort_keys=True).encode()),
+            "provider_invalid_ohlc_ordering_omitted_count": omitted_observations,
+            "provider_invalid_ohlc_ordering_payload_count": omitted_payloads,
+            "provider_invalid_high_order_row_count": invalid_high_rows,
+            "provider_invalid_low_order_row_count": invalid_low_rows,
+            "provider_invalid_both_order_row_count": invalid_both_rows,
             "model_fits": 0, "backtests": 0, "outcome_calculations": 0}
     completed = _existing_json(output / "safe-manifest.json")
     if completed is not None:

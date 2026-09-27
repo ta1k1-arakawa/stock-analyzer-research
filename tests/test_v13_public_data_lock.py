@@ -164,6 +164,7 @@ def test_yahoo_exact_close_above_high_is_missing_only_with_explicit_opt_in(tmp_p
     assert rows[days[1]]["adj_close"] == 50.0
     assert manifest["observation_count"] == 1
     assert manifest["omitted_close_above_high_count"] == 1
+    assert manifest["omitted_provider_invalid_ohlc_ordering_count"] == 0
     assert lock.raw == raw == (tmp_path / "yahoo.raw").read_bytes()
     assert all(row["close"] != 101.0 for row in rows.values())
     valid_lock = p.RawLock.from_bytes(json.dumps(_yahoo(days)).encode())
@@ -172,6 +173,110 @@ def test_yahoo_exact_close_above_high_is_missing_only_with_explicit_opt_in(tmp_p
                                                omit_close_above_high=True)
     assert opted_valid == strict_valid
     assert valid_manifest["omitted_close_above_high_count"] == 0
+    assert valid_manifest["omitted_provider_invalid_ohlc_ordering_count"] == 0
+
+
+@pytest.mark.parametrize(("changes", "high_count", "low_count", "both_count"), [
+    ({"high": 99, "low": 95}, 1, 0, 0),
+    ({"high": 110, "low": 101}, 0, 1, 0),
+    ({"high": 99, "low": 101}, 1, 1, 1),
+])
+def test_successor_ordering_invalid_rows_are_missing(changes, high_count, low_count, both_count):
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    payload = _yahoo(days)
+    quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    for field, value in changes.items():
+        quote[field][0] = value
+    lock = p.RawLock.from_bytes(json.dumps(payload).encode())
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(lock, "1000")
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(lock, "1000", omit_close_above_high=True)
+    rows, manifest = p.parse_yahoo(lock, "1000", omit_provider_invalid_ohlc_ordering=True)
+    assert set(rows) == {days[1]}
+    assert manifest["omitted_close_above_high_count"] == 0
+    assert manifest["omitted_provider_invalid_ohlc_ordering_count"] == 1
+    assert manifest["provider_invalid_high_order_row_count"] == high_count
+    assert manifest["provider_invalid_low_order_row_count"] == low_count
+    assert manifest["provider_invalid_both_order_row_count"] == both_count
+
+
+def test_successor_mode_conflict_and_historical_derived_equality(tmp_path):
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    payload = _yahoo(days)
+    quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    quote["high"][0], quote["close"][0] = 100, 101
+    lock = p.RawLock.from_bytes(json.dumps(payload).encode())
+    with pytest.raises(ValueError, match="^YAHOO_OMISSION_MODE_CONFLICT$"):
+        p.parse_yahoo(lock, "1000", omit_close_above_high=True,
+                      omit_provider_invalid_ohlc_ordering=True)
+    historical, old_manifest = p.parse_yahoo(lock, "1000", omit_close_above_high=True)
+    successor, new_manifest = p.parse_yahoo(lock, "1000",
+                                              omit_provider_invalid_ohlc_ordering=True)
+    assert historical == successor
+    assert old_manifest["omitted_close_above_high_count"] == 1
+    assert new_manifest["omitted_close_above_high_count"] == 0
+    assert new_manifest["omitted_provider_invalid_ohlc_ordering_count"] == 1
+    derived = tmp_path / "price.private.json"
+    old_bytes = runner._json_bytes({day.isoformat(): row for day, row in historical.items()})
+    derived.write_bytes(old_bytes)
+    runner._bound_json(derived, {day.isoformat(): row for day, row in successor.items()})
+    assert derived.read_bytes() == old_bytes
+
+
+@pytest.mark.parametrize("value", [None, "bad", -1, 0, float("inf")])
+def test_successor_preserves_numeric_failures(value):
+    payload = _yahoo([date(2025, 12, 29), date(2025, 12, 30)])
+    payload["chart"]["result"][0]["indicators"]["quote"][0]["high"][0] = value
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+
+
+def test_successor_exact_decimal_and_invalid_split_fail_closed():
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    raw = json.dumps(_yahoo(days), separators=(",", ":")).encode()
+    raw = raw.replace(b'"high":[110.0,55.0]', b'"high":[100.000000000000000000,55.0]')
+    raw = raw.replace(b'"close":[100.0,50.0]', b'"close":[100.000000000000000001,50.0]')
+    rows, manifest = p.parse_yahoo(p.RawLock.from_bytes(raw), "1000",
+                                    omit_provider_invalid_ohlc_ordering=True)
+    assert set(rows) == {days[1]}
+    assert manifest["provider_invalid_high_order_row_count"] == 1
+    payload = _yahoo(days)
+    payload["chart"]["result"][0]["indicators"]["quote"][0]["high"][0] = 99
+    payload["chart"]["result"][0]["events"]["splits"]["one"]["denominator"] = 0
+    with pytest.raises(ValueError, match="YAHOO_INVALID_SPLIT"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+    raw = json.dumps(_yahoo(days), separators=(",", ":")).encode()
+    raw = raw.replace(b'"high":[110.0,55.0]', b'"high":[1e400,55.0]')
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(p.RawLock.from_bytes(raw), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+
+
+def test_successor_structure_and_duplicate_fail_closed():
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    payload = _yahoo(days)
+    payload["chart"]["result"][0]["timestamp"][1] = _timestamp(days[0])
+    with pytest.raises(ValueError, match="YAHOO_DUPLICATE_SESSION"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+    payload = _yahoo(days)
+    payload["chart"]["result"][0]["meta"]["symbol"] = "OTHER.T"
+    with pytest.raises(ValueError, match="YAHOO_SYMBOL_MISMATCH"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+    payload = _yahoo(days)
+    payload["chart"]["result"][0]["indicators"]["quote"][0]["high"].pop()
+    with pytest.raises(ValueError, match="YAHOO_LENGTH_MISMATCH"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
+    payload = _yahoo(days)
+    payload["chart"]["error"] = "synthetic"
+    with pytest.raises(ValueError, match="YAHOO_CHART_ERROR"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_provider_invalid_ohlc_ordering=True)
 
 
 @pytest.mark.parametrize("changes", [
@@ -391,12 +496,14 @@ def test_resume_only_fetches_missing_payloads(tmp_path, monkeypatch, capsys):
     assert counts == previous
 
 
-def test_runner_explicit_opt_in_enforces_one_omission_across_selected_loop(tmp_path, monkeypatch):
+def test_runner_successor_aggregates_ordering_omissions_without_cap(tmp_path, monkeypatch):
     args, output, _, _, _, base_fetch = _synthetic_run(tmp_path, monkeypatch)
     selected = frozen_select({f"{n:04d}": "Sector" for n in range(2000, 2600)},
                              set(_t1()) | set(f"{n:04d}" for n in range(1200, 1500))
                              | p.LEGACY_OUTSIDE_V4, p.SEED)
-    invalid_codes = {selected[0]}
+    invalid_codes = {selected[0]: {"close": 12},
+                     selected[1]: {"high": 13, "low": 12},
+                     selected[2]: {"high": 9, "low": 12}}
     locked_payloads = {}
 
     def fetch(url):
@@ -405,39 +512,41 @@ def test_runner_explicit_opt_in_enforces_one_omission_across_selected_loop(tmp_p
             code = url.split("/chart/")[1].split(".T")[0]
             if code in invalid_codes:
                 payload = json.loads(raw)
-                quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
-                quote["close"][0] = 12
+                result = payload["chart"]["result"][0]
+                quote = result["indicators"]["quote"][0]
+                for field, value in invalid_codes[code].items():
+                    quote[field][0] = value
+                if code == selected[0]:
+                    result["timestamp"].append(_timestamp(date(2025, 12, 29)))
+                    for field, value in (("open", 10), ("high", 11), ("low", 9),
+                                         ("close", 12), ("volume", 100)):
+                        quote[field].append(value)
                 raw = json.dumps(payload).encode()
                 locked_payloads[code] = raw
         return io.BytesIO(raw)
 
     safe = runner.execute(**args, fetch=fetch)
+    assert safe["schema"] == "V13_PUBLIC_DATALOCK_SAFE_MANIFEST_V2"
     assert safe["yahoo_payload_count"] == 500
+    assert safe["provider_invalid_ohlc_ordering_omitted_count"] == 4
+    assert safe["provider_invalid_ohlc_ordering_payload_count"] == 3
+    assert safe["provider_invalid_high_order_row_count"] == 3
+    assert safe["provider_invalid_low_order_row_count"] == 2
+    assert safe["provider_invalid_both_order_row_count"] == 1
+    assert (safe["model_fits"], safe["backtests"], safe["outcome_calculations"]) == (0, 0, 0)
+    for code in selected[:3]:
+        assert code not in json.dumps(safe)
+        assert json.loads((output / f"price-{code}.private.json").read_text()) == {}
     assert (output / f"yahoo-{selected[0]}.raw").read_bytes() == locked_payloads[selected[0]]
-    assert json.loads((output / f"price-{selected[0]}.private.json").read_text()) == {}
-    assert len(json.loads((output / f"price-{selected[1]}.private.json").read_text())) == 1
-
-    second_root = tmp_path / "second"
-    second_root.mkdir()
-    second_args, second_output, _, _, _, second_base_fetch = _synthetic_run(
-        second_root, monkeypatch)
-    invalid_codes.add(selected[1])
-
-    def second_fetch(url):
-        raw = second_base_fetch(url).read()
-        if "/chart/" in url:
-            code = url.split("/chart/")[1].split(".T")[0]
-            if code in invalid_codes:
-                payload = json.loads(raw)
-                payload["chart"]["result"][0]["indicators"]["quote"][0]["close"][0] = 12
-                raw = json.dumps(payload).encode()
-        return io.BytesIO(raw)
-
-    with pytest.raises(ValueError, match="YAHOO_CLOSE_ABOVE_HIGH_OMISSION_LIMIT"):
-        runner.execute(**second_args, fetch=second_fetch)
-    assert (second_output / f"price-{selected[0]}.private.json").exists()
-    assert not (second_output / f"price-{selected[1]}.private.json").exists()
-    assert not (second_output / "safe-manifest.json").exists()
+    assert len(json.loads((output / f"price-{selected[3]}.private.json").read_text())) == 1
+    before = {code: (output / f"yahoo-{code}.raw").read_bytes() for code in selected[:3]}
+    runner.execute(**args, fetch=lambda _url: (_ for _ in ()).throw(AssertionError("refetch")))
+    assert all((output / f"yahoo-{code}.raw").read_bytes() == raw for code, raw in before.items())
+    price = output / f"price-{selected[0]}.private.json"
+    price.write_text('{"tampered":true}')
+    with pytest.raises(ValueError, match="DURABLE_STATE_MISMATCH"):
+        runner.execute(**args, fetch=lambda _url: (_ for _ in ()).throw(AssertionError("refetch")))
+    assert price.read_text() == '{"tampered":true}'
 
 
 def test_semantic_failure_and_pending_fail_closed(tmp_path, monkeypatch):

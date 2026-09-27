@@ -431,8 +431,11 @@ def select_universe(eligible: dict[str, str], excluded: set[str], jpx_lock: RawL
     return selected, manifest
 
 
-def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False) -> tuple[dict[date, dict[str, float]], dict[str, Any]]:
+def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False,
+                omit_provider_invalid_ohlc_ordering: bool = False) -> tuple[dict[date, dict[str, float]], dict[str, Any]]:
     """Parse a locked chart response; split factors exclude dividend adjustments."""
+    if omit_close_above_high and omit_provider_invalid_ohlc_ordering:
+        raise ValueError("YAHOO_OMISSION_MODE_CONFLICT")
     code = _codes([code])[0]
     # Compare the provider's JSON numbers exactly in both strict and opted-in
     # paths; normalized valid rows remain ordinary floats.
@@ -451,6 +454,10 @@ def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False
     observations: dict[date, dict[str, float]] = {}
     seen_days: set[date] = set()
     omitted_count = 0
+    omitted_ordering_count = 0
+    invalid_high_count = 0
+    invalid_low_count = 0
+    invalid_both_count = 0
     for i, timestamp in enumerate(timestamps):
         day = datetime.fromtimestamp(timestamp, zone).date()
         if not START <= day <= END:
@@ -469,7 +476,15 @@ def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False
                 and high >= max(opening, low) and low <= min(opening, close)):
             omitted_count += 1
             continue
-        if min(opening, high, low, close) <= 0 or high < max(opening, close, low) or low > min(opening, close):
+        high_invalid = high < max(opening, close, low)
+        low_invalid = low > min(opening, close)
+        if omit_provider_invalid_ohlc_ordering and (high_invalid or low_invalid):
+            omitted_ordering_count += 1
+            invalid_high_count += int(high_invalid)
+            invalid_low_count += int(low_invalid)
+            invalid_both_count += int(high_invalid and low_invalid)
+            continue
+        if high_invalid or low_invalid:
             raise ValueError("YAHOO_INVALID_OHLCV")
         opening, high, low, close, volume = normalized_values
         observations[day] = {"open": opening, "high": high, "low": low,
@@ -490,6 +505,10 @@ def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False
         row["adj_close"] = row["close"] * factor
     return observations, {**lock.manifest(), "observation_count": len(observations),
                           "omitted_close_above_high_count": omitted_count,
+                          "omitted_provider_invalid_ohlc_ordering_count": omitted_ordering_count,
+                          "provider_invalid_high_order_row_count": invalid_high_count,
+                          "provider_invalid_low_order_row_count": invalid_low_count,
+                          "provider_invalid_both_order_row_count": invalid_both_count,
                           "split_event_count": len(splits), "start": START.isoformat(),
                           "end_inclusive": END.isoformat(), "period2_exclusive": "2026-01-01"}
 
