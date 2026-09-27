@@ -31,8 +31,8 @@ def test_synthetic_identity_and_reparse_gates(tmp_path: Path, scenario: str, exp
     script = tmp_path / "repo" / "scripts" / SCRIPT.name
     script.parent.mkdir(parents=True)
     source = SCRIPT.read_text(encoding="ascii")
-    # Stop at the reviewed Python boundary. This synthetic copy cannot invoke Python or HTTP.
-    source = source.split("    $pythonExe = Join-Path $repoRoot", 1)[0]
+    # Stop before reviewed-source and Python preflight. This synthetic copy tests path gates only.
+    source = source.split("    # Bind the reviewed Issue #121 implementation", 1)[0]
     source += "    Write-Output 'SYNTHETIC_DOWNSTREAM_BOUNDARY'\n}\n"
     script.write_text(source, encoding="ascii")
     repo = script.parent.parent

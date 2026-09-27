@@ -166,6 +166,23 @@ param(
         if ($candidatePath.StartsWith($repoRoot + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
             $candidatePath -ceq $repoRoot) { throw 'BLOCK_PRIVATE_OR_RAW_PATH_IN_REPOSITORY' }
     }
+    # Bind the reviewed Issue #121 implementation before any private read or public acquisition.
+    function Assert-ReviewedSourceBlob([string] $relative, [string] $expectedBlob) {
+        $path = Join-Path $repoRoot $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "BLOCK_REVIEWED_SOURCE_MISSING:$relative"
+        }
+        $headBlob = (& git rev-parse "HEAD:$relative").Trim()
+        if ($LASTEXITCODE -ne 0 -or $headBlob -cne $expectedBlob) {
+            throw "BLOCK_REVIEWED_SOURCE_TREE_MISMATCH:$relative"
+        }
+        $worktreeBlob = (& git hash-object --path $relative -- $path).Trim()
+        if ($LASTEXITCODE -ne 0 -or $worktreeBlob -cne $expectedBlob) {
+            throw "BLOCK_REVIEWED_SOURCE_WORKTREE_MISMATCH:$relative"
+        }
+    }
+    Assert-ReviewedSourceBlob 'scripts/v13_public_data_lock_execute.py' '592b4713d06dd2e2e23e31cf58e6397955fc3078'
+    Assert-ReviewedSourceBlob 'src/v13_public_data_lock.py' 'aa18f8f31b524d3e8543cf6b9a86c1d980087b7b'
     $pythonExe = Join-Path $repoRoot '.venv-real-execution\Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) { throw 'BLOCK_CANONICAL_ENVIRONMENT' }
     & $pythonExe scripts/check_current_protected_environment.py
