@@ -55,10 +55,10 @@ V13_SAFE_RESULT_BLOB_SHA1 = "a90b3e3e2738c4c304755c16221a96e48336010c"
 V13_AUTHORIZATION_BLOB_SHA1 = "ff00b49346153dfe7d506432d8358713bbd7fa87"
 V13_DELTA = ["et-xmlfile==2.0.0", "openpyxl==3.1.5"]
 REVIEWED_PROBE_BLOBS = {
-    "scripts/v13_xlsx_readiness.py": "e7c1da8c15f4c74dbdccd2686219653d66b6c2ab",
-    "src/v13_public_data_lock.py": "06b634e4f5f95b167a7b9ed595ae38544d8ddb8c",
-    "scripts/v9_014_pdf_env_successor.py": "0f60c6ad8519f89c51984231c6248d28e785271e",
-    "tests/fixtures/v9_014_synthetic_pdf_env_probe.pdf": "96b5c60b9b8b63eeb3241f04f184edae7f14ccbf",
+    "scripts/v13_xlsx_readiness.py": (V13_REVIEWED_SHA, "e7c1da8c15f4c74dbdccd2686219653d66b6c2ab"),
+    "src/v13_public_data_lock.py": ("fbfe886254cf1ac053270857b7f188e83d948a75", "aa18f8f31b524d3e8543cf6b9a86c1d980087b7b"),
+    "scripts/v9_014_pdf_env_successor.py": (V13_REVIEWED_SHA, "0f60c6ad8519f89c51984231c6248d28e785271e"),
+    "tests/fixtures/v9_014_synthetic_pdf_env_probe.pdf": (V13_REVIEWED_SHA, "96b5c60b9b8b63eeb3241f04f184edae7f14ccbf"),
 }
 
 CURRENT_AUTHORITY_REVIEWED_SHA = "92cc4a964af798f9543155e32eb83a12e7352151"
@@ -385,7 +385,7 @@ def resolve_current_authority(
         "V13_XLSX_PREDECESSOR_27_PACKAGE_AUTHORITY_HISTORICAL": "true",
         "V13_XLSX_ISSUE110_GPT_REVIEWED_SHA": V13_REVIEWED_SHA,
         "V13_XLSX_ISSUE110_GPT_REVIEW_COMMENT_ID": "5851650708",
-        "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS": "AWAITING_GPT_EXACT_SHA_REVIEW",
+        "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS": "PASS",
         "V13_XLSX_FUTURE_PROFITABILITY_ESTABLISHED": "false",
     }
     for key, expected in expected_state.items():
@@ -410,8 +410,8 @@ def resolve_current_authority(
         if not path.is_file() or _working_blob_sha1(repo_root, relative_name, path) != expected_blob:
             return {"status": "FAIL", "reason": "V13_AUTHORITY_WORKING_BLOB_MISMATCH", "artifact": label}
         raw[label] = blob
-    for relative_name, expected_blob in REVIEWED_PROBE_BLOBS.items():
-        blob = git_blob_reader(repo_root, f"{V13_REVIEWED_SHA}:{relative_name}")
+    for relative_name, (reviewed_sha, expected_blob) in REVIEWED_PROBE_BLOBS.items():
+        blob = git_blob_reader(repo_root, f"{reviewed_sha}:{relative_name}")
         if blob is None or _git_blob_sha1(blob) != expected_blob:
             return {"status": "FAIL", "reason": "V13_REVIEWED_PROBE_BLOB_MISMATCH", "artifact": relative_name}
         if _working_blob_sha1(repo_root, relative_name, repo_root / relative_name) != expected_blob:

@@ -53,6 +53,7 @@ def _isolated_evidence(package_map: dict[str, str], **overrides) -> dict:
 
 
 def test_current_authority_resolves_to_v13_29_package_chain() -> None:
+    assert "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS=PASS" in checker.PROJECT_STATE_PATH.read_text(encoding="utf-8")
     result = checker.resolve_current_authority()
     assert result["status"] == "PASS"
     assert result["study"] == "V13_PROTECTED_XLSX_ENVIRONMENT_SUCCESSOR"
@@ -106,6 +107,36 @@ def test_current_checker_binds_reviewed_safe_result(monkeypatch) -> None:
     assert result["status"] == "PASS"
     assert f"{checker.V13_REVIEWED_SHA}:docs/v13/V13_XLSX_SUCCESSOR_ACTIVE_ENV_MUTATION_SAFE_RESULT.json" in calls
     assert checker.V13_PROMOTION_BLOB_SHA1 in calls
+
+
+def test_parser_probe_uses_issue_121_reviewed_git_object_and_worktree_blob(monkeypatch) -> None:
+    parser_path = "src/v13_public_data_lock.py"
+    reviewed_sha = "fbfe886254cf1ac053270857b7f188e83d948a75"
+    reviewed_blob = "aa18f8f31b524d3e8543cf6b9a86c1d980087b7b"
+    assert checker.REVIEWED_PROBE_BLOBS[parser_path] == (reviewed_sha, reviewed_blob)
+    calls: list[str] = []
+
+    def recording_reader(repo_root: Path, git_ref: str):
+        calls.append(git_ref)
+        return checker._git_blob_bytes(repo_root, git_ref)
+
+    assert checker.resolve_current_authority(git_blob_reader=recording_reader)["status"] == "PASS"
+    assert f"{reviewed_sha}:{parser_path}" in calls
+    for path, (sha, blob) in checker.REVIEWED_PROBE_BLOBS.items():
+        assert f"{sha}:{path}" in calls
+        assert checker._git_blob_sha1(checker._git_blob_bytes(checker.REPO_ROOT, f"{sha}:{path}")) == blob
+
+    original = checker._working_blob_sha1
+
+    def wrong_parser(repo_root: Path, relative_name: str, path: Path) -> str | None:
+        if relative_name == parser_path:
+            return "0" * 40
+        return original(repo_root, relative_name, path)
+
+    monkeypatch.setattr(checker, "_working_blob_sha1", wrong_parser)
+    assert checker.resolve_current_authority() == {
+        "status": "FAIL", "reason": "V13_WORKING_PROBE_BLOB_MISMATCH", "artifact": parser_path,
+    }
 
 
 def test_current_package_set_matches_the_resolved_29_package_lock() -> None:
@@ -187,6 +218,19 @@ def test_missing_current_authority_fails_closed(tmp_path: Path) -> None:
     result = checker.resolve_current_authority(state_path=state_path)
     assert result["status"] == "FAIL"
     assert result["reason"] == "CURRENT_AUTHORITY_STATE_VALUE_MISMATCH"
+
+
+def test_stale_promotion_review_status_fails_closed(tmp_path: Path) -> None:
+    state = checker.PROJECT_STATE_PATH.read_text(encoding="utf-8").replace(
+        "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS=PASS",
+        "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS=AWAITING_GPT_EXACT_SHA_REVIEW",
+        1,
+    )
+    state_path = tmp_path / "PROJECT_STATE.md"
+    state_path.write_text(state, encoding="utf-8")
+    assert checker.resolve_current_authority(state_path=state_path) == {
+        "status": "FAIL", "reason": "CURRENT_AUTHORITY_STATE_VALUE_MISMATCH",
+    }
 
 
 def test_ambiguous_current_authority_fails_closed(tmp_path: Path) -> None:
