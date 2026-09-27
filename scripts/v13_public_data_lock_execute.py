@@ -155,6 +155,7 @@ def execute(*, t1_state: Path, v4_csv: Path, calendar_lock: Path,
     universe_manifest["jpx_page_raw_sha256"] = page.sha256
     _bound_json(output / "selected.private.json", {"selected": selected})
     price_manifests = []
+    omitted_observations = 0
     tokyo = ZoneInfo("Asia/Tokyo")
     period1 = int(datetime(2015, 1, 1, tzinfo=tokyo).timestamp())
     period2 = int(datetime(2026, 1, 1, tzinfo=tokyo).timestamp())
@@ -164,7 +165,10 @@ def execute(*, t1_state: Path, v4_csv: Path, calendar_lock: Path,
     for code in selected:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.T?{params}"
         lock = _raw(url, output / f"yahoo-{code}.raw", fetch)
-        rows, manifest = pipeline.parse_yahoo(lock, code)
+        rows, manifest = pipeline.parse_yahoo(lock, code, omit_close_above_high=True)
+        omitted_observations += manifest["omitted_close_above_high_count"]
+        if omitted_observations > 1:
+            raise ValueError("YAHOO_CLOSE_ABOVE_HIGH_OMISSION_LIMIT")
         _bound_json(output / f"price-{code}.private.json",
                     {day.isoformat(): row for day, row in rows.items()})
         price_manifests.append(manifest)

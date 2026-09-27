@@ -17,6 +17,7 @@ import zipfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable
@@ -430,10 +431,12 @@ def select_universe(eligible: dict[str, str], excluded: set[str], jpx_lock: RawL
     return selected, manifest
 
 
-def parse_yahoo(lock: RawLock, code: str) -> tuple[dict[date, dict[str, float]], dict[str, Any]]:
+def parse_yahoo(lock: RawLock, code: str, *, omit_close_above_high: bool = False) -> tuple[dict[date, dict[str, float]], dict[str, Any]]:
     """Parse a locked chart response; split factors exclude dividend adjustments."""
     code = _codes([code])[0]
-    root = json.loads(lock.raw)
+    # Compare the provider's JSON numbers exactly in both strict and opted-in
+    # paths; normalized valid rows remain ordinary floats.
+    root = json.loads(lock.raw, parse_float=Decimal)
     chart = root["chart"]
     if chart.get("error") is not None or len(chart["result"]) != 1:
         raise ValueError("YAHOO_CHART_ERROR")
@@ -446,18 +449,29 @@ def parse_yahoo(lock: RawLock, code: str) -> tuple[dict[date, dict[str, float]],
         raise ValueError("YAHOO_LENGTH_MISMATCH")
     zone = ZoneInfo("Asia/Tokyo")
     observations: dict[date, dict[str, float]] = {}
+    seen_days: set[date] = set()
+    omitted_count = 0
     for i, timestamp in enumerate(timestamps):
         day = datetime.fromtimestamp(timestamp, zone).date()
         if not START <= day <= END:
             raise ValueError("YAHOO_DATE_OUT_OF_WINDOW")
-        if day in observations:
+        if day in seen_days:
             raise ValueError("YAHOO_DUPLICATE_SESSION")
+        seen_days.add(day)
         raw_values = [quote[k][i] for k in ("open", "high", "low", "close", "volume")]
-        if any(type(v) not in (float, int) or not math.isfinite(v) or v < 0 for v in raw_values):
+        if any(type(v) not in (float, int, Decimal) or not math.isfinite(v) or v < 0 for v in raw_values):
             raise ValueError("YAHOO_INVALID_OHLCV")
-        opening, high, low, close, volume = map(float, raw_values)
+        normalized_values = tuple(map(float, raw_values))
+        if not all(math.isfinite(v) for v in normalized_values) or min(normalized_values[:4]) <= 0:
+            raise ValueError("YAHOO_INVALID_OHLCV")
+        opening, high, low, close, volume = raw_values
+        if (omit_close_above_high and close > high
+                and high >= max(opening, low) and low <= min(opening, close)):
+            omitted_count += 1
+            continue
         if min(opening, high, low, close) <= 0 or high < max(opening, close, low) or low > min(opening, close):
             raise ValueError("YAHOO_INVALID_OHLCV")
+        opening, high, low, close, volume = normalized_values
         observations[day] = {"open": opening, "high": high, "low": low,
                              "close": close, "volume": volume, "traded_value": close * volume}
     split_events = result.get("events", {}).get("splits", {})
@@ -465,9 +479,9 @@ def parse_yahoo(lock: RawLock, code: str) -> tuple[dict[date, dict[str, float]],
     for event in split_events.values():
         day = datetime.fromtimestamp(event["date"], zone).date()
         numerator, denominator = event["numerator"], event["denominator"]
-        if not START <= day <= END or any(type(x) not in (int, float) or not math.isfinite(x) or x <= 0 for x in (numerator, denominator)):
+        if not START <= day <= END or any(type(x) not in (int, float, Decimal) or not math.isfinite(x) or x <= 0 for x in (numerator, denominator)):
             raise ValueError("YAHOO_INVALID_SPLIT")
-        splits.append((day, numerator / denominator))
+        splits.append((day, float(numerator) / float(denominator)))
     for day, row in observations.items():
         factor = math.prod(1 / ratio for split_day, ratio in splits if day < split_day)
         row["adj_open"] = row["open"] * factor
@@ -475,6 +489,7 @@ def parse_yahoo(lock: RawLock, code: str) -> tuple[dict[date, dict[str, float]],
         row["adj_low"] = row["low"] * factor
         row["adj_close"] = row["close"] * factor
     return observations, {**lock.manifest(), "observation_count": len(observations),
+                          "omitted_close_above_high_count": omitted_count,
                           "split_event_count": len(splits), "start": START.isoformat(),
                           "end_inclusive": END.isoformat(), "period2_exclusive": "2026-01-01"}
 

@@ -147,6 +147,70 @@ def test_yahoo_split_only_raw_execution_and_2026_rejection(tmp_path: Path):
     assert len(alpha_rows) == 2
 
 
+def test_yahoo_exact_close_above_high_is_missing_only_with_explicit_opt_in(tmp_path):
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    payload = _yahoo(days)
+    quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    quote["high"][0] = 100.0
+    quote["close"][0] = 101.0
+    raw = json.dumps(payload).encode()
+    lock = p.lock_payload(raw, tmp_path / "yahoo.raw")
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(lock, "1000")
+    rows, manifest = p.parse_yahoo(lock, "1000", omit_close_above_high=True)
+    assert days[0] not in rows
+    assert set(rows) == {days[1]}
+    assert rows[days[1]]["close"] == 50.0
+    assert rows[days[1]]["adj_close"] == 50.0
+    assert manifest["observation_count"] == 1
+    assert manifest["omitted_close_above_high_count"] == 1
+    assert lock.raw == raw == (tmp_path / "yahoo.raw").read_bytes()
+    assert all(row["close"] != 101.0 for row in rows.values())
+    valid_lock = p.RawLock.from_bytes(json.dumps(_yahoo(days)).encode())
+    strict_valid, _ = p.parse_yahoo(valid_lock, "1000")
+    opted_valid, valid_manifest = p.parse_yahoo(valid_lock, "1000",
+                                               omit_close_above_high=True)
+    assert opted_valid == strict_valid
+    assert valid_manifest["omitted_close_above_high_count"] == 0
+
+
+@pytest.mark.parametrize("changes", [
+    {"open": 120.0, "high": 100.0, "close": 101.0},
+    {"low": 105.0, "high": 100.0, "close": 101.0},
+    {"close": 0.0},
+    {"volume": -1},
+    {"high": 99.0, "close": 100.0, "low": 101.0},
+])
+def test_yahoo_other_invalid_shapes_stay_strict(changes):
+    payload = _yahoo([date(2025, 12, 29), date(2025, 12, 30)])
+    quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    for field, value in changes.items():
+        quote[field][0] = value
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_close_above_high=True)
+
+
+def test_yahoo_exact_decimal_comparison_and_duplicate_omitted_session():
+    days = [date(2025, 12, 29), date(2025, 12, 30)]
+    raw = json.dumps(_yahoo(days), separators=(",", ":")).encode()
+    raw = raw.replace(b'"high":[110.0,55.0]', b'"high":[100.000000000000000000,55.0]')
+    raw = raw.replace(b'"close":[100.0,50.0]', b'"close":[100.000000000000000001,50.0]')
+    with pytest.raises(ValueError, match="YAHOO_INVALID_OHLCV"):
+        p.parse_yahoo(p.RawLock.from_bytes(raw), "1000")
+    rows, manifest = p.parse_yahoo(p.RawLock.from_bytes(raw), "1000",
+                                   omit_close_above_high=True)
+    assert set(rows) == {days[1]}
+    assert manifest["omitted_close_above_high_count"] == 1
+    payload = _yahoo([days[0], days[0]])
+    quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+    quote["high"][0] = 100.0
+    quote["close"][0] = 101.0
+    with pytest.raises(ValueError, match="YAHOO_DUPLICATE_SESSION"):
+        p.parse_yahoo(p.RawLock.from_bytes(json.dumps(payload).encode()), "1000",
+                      omit_close_above_high=True)
+
+
 def test_calendar_exact_offsets_and_retry(tmp_path: Path):
     raw = b"2025-12-26\n2025-12-29\n2025-12-30\n2025-12-31\n"
     sessions, manifest = p.parse_calendar(p.lock_payload(raw, tmp_path / "calendar.raw"))
@@ -325,6 +389,55 @@ def test_resume_only_fetches_missing_payloads(tmp_path, monkeypatch, capsys):
     with pytest.raises(ValueError, match="DURABLE_STATE_MISMATCH"):
         runner.execute(**args, fetch=fetch)
     assert counts == previous
+
+
+def test_runner_explicit_opt_in_enforces_one_omission_across_selected_loop(tmp_path, monkeypatch):
+    args, output, _, _, _, base_fetch = _synthetic_run(tmp_path, monkeypatch)
+    selected = frozen_select({f"{n:04d}": "Sector" for n in range(2000, 2600)},
+                             set(_t1()) | set(f"{n:04d}" for n in range(1200, 1500))
+                             | p.LEGACY_OUTSIDE_V4, p.SEED)
+    invalid_codes = {selected[0]}
+    locked_payloads = {}
+
+    def fetch(url):
+        raw = base_fetch(url).read()
+        if "/chart/" in url:
+            code = url.split("/chart/")[1].split(".T")[0]
+            if code in invalid_codes:
+                payload = json.loads(raw)
+                quote = payload["chart"]["result"][0]["indicators"]["quote"][0]
+                quote["close"][0] = 12
+                raw = json.dumps(payload).encode()
+                locked_payloads[code] = raw
+        return io.BytesIO(raw)
+
+    safe = runner.execute(**args, fetch=fetch)
+    assert safe["yahoo_payload_count"] == 500
+    assert (output / f"yahoo-{selected[0]}.raw").read_bytes() == locked_payloads[selected[0]]
+    assert json.loads((output / f"price-{selected[0]}.private.json").read_text()) == {}
+    assert len(json.loads((output / f"price-{selected[1]}.private.json").read_text())) == 1
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second_args, second_output, _, _, _, second_base_fetch = _synthetic_run(
+        second_root, monkeypatch)
+    invalid_codes.add(selected[1])
+
+    def second_fetch(url):
+        raw = second_base_fetch(url).read()
+        if "/chart/" in url:
+            code = url.split("/chart/")[1].split(".T")[0]
+            if code in invalid_codes:
+                payload = json.loads(raw)
+                payload["chart"]["result"][0]["indicators"]["quote"][0]["close"][0] = 12
+                raw = json.dumps(payload).encode()
+        return io.BytesIO(raw)
+
+    with pytest.raises(ValueError, match="YAHOO_CLOSE_ABOVE_HIGH_OMISSION_LIMIT"):
+        runner.execute(**second_args, fetch=second_fetch)
+    assert (second_output / f"price-{selected[0]}.private.json").exists()
+    assert not (second_output / f"price-{selected[1]}.private.json").exists()
+    assert not (second_output / "safe-manifest.json").exists()
 
 
 def test_semantic_failure_and_pending_fail_closed(tmp_path, monkeypatch):

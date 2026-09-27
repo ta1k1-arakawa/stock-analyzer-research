@@ -4541,3 +4541,8 @@ Issue #83 GPT protected-execution adjudication PASS at `8506a21972f8104d0cae3a33
 - Issue #117 commit `df7b7e5dfe8a69e83023223a31808332c84bf30f` received GPT-5.6 Sol BLOCK (comment `5852577374`) solely for its execution bootstrap/provenance path, not for substantive governance content.
 - From a compliant local Codex managed task workspace, Issue #118 independently revalidated all 15 inherited Issue #117 governance requirements against that exact tree. The inherited governance is prospectively adopted as current project governance, subject to GPT exact-SHA PASS of this task; the Issue #117 functional tree is unchanged.
 - No methodology, frozen study, data/provider, threshold, human gate, or real-execution authority changed.
+
+## 2026-09-27 — Issue #121 V13 exact provider-invalid OHLCV remediation
+
+- The human-approved methodology decision after Issue #120 is to treat the single diagnosed exact provider-invalid CLOSE-above-HIGH observation as missing. Raw provider bytes remain immutable; value repair, clamping, rounding, imputation or fill, refetch, ticker substitution, and global validator relaxation remain forbidden.
+- The V13 production public-data-lock runner explicitly opts in to this one structural omission and enforces a cumulative maximum of one omitted observation across the complete selected-security run. Every other invalid OHLCV shape remains fail-closed. The shared parser is strict by default; no additional methodology discretion is delegated to the executor.
