@@ -62,6 +62,16 @@ def test_authorization_frozen_bindings_and_scope():
 def test_wrapper_checks_before_private_or_network_boundary():
     source = SCRIPT.read_text(encoding="ascii")
     boundary = source.index("& $pythonExe scripts/v13_public_data_lock_execute.py --t1-state")
+    reviewed_sources = {
+        "scripts/v13_public_data_lock_execute.py": "1eda70521328101b7d82408e28401d48d5ec8502",
+        "src/v13_public_data_lock.py": "9ba735105a6bb6e944300812d425c04ac08df185",
+    }
+    for path, blob in reviewed_sources.items():
+        binding = f"Assert-ReviewedSourceBlob '{path}' '{blob}'"
+        assert source.index("function Assert-ReviewedSourceBlob") < source.index(binding) < boundary
+        assert subprocess.check_output(["git", "rev-parse", f"HEAD:{path}"], cwd=ROOT, text=True).strip() == blob
+    assert source.index("BLOCK_REVIEWED_SOURCE_TREE_MISMATCH") < boundary
+    assert source.index("BLOCK_REVIEWED_SOURCE_WORKTREE_MISMATCH") < boundary
     for required in (
         "git branch --show-current", "git rev-parse HEAD", "git ls-remote origin",
         "git status --porcelain", "git merge-base $ApprovedImplementationSha $ExecutionHead",
@@ -72,6 +82,7 @@ def test_wrapper_checks_before_private_or_network_boundary():
     ):
         assert source.index(required) < boundary
     assert "authorization.execution_head" not in source
+    assert "6b4454aafc05c66c37d75e33a586d79653c1a413" in source
     assert AUTH_BLOB in source and CALENDAR_BLOB in source and STANDING_BLOB in source
     assert source.index("if (-not $Execute)") < source.index("Set-Location -LiteralPath $repoRoot")
     assigned = re.findall(r"\$([A-Za-z][A-Za-z0-9_]*)\s*=", source)
@@ -99,6 +110,42 @@ def test_powershell_rehearsal_and_parse():
     assert "NETWORK_REQUESTS=0" in rehearsal.stdout
     assert "PRIVATE_READS=0" in rehearsal.stdout
     assert "REAL_UNIVERSE_SELECTED=false" in rehearsal.stdout
+
+
+@pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell unavailable")
+@pytest.mark.parametrize("mismatch,expected", [
+    ("tree", "BLOCK_REVIEWED_SOURCE_TREE_MISMATCH"),
+    ("worktree", "BLOCK_REVIEWED_SOURCE_WORKTREE_MISMATCH"),
+])
+def test_reviewed_source_binding_fails_closed_on_synthetic_mismatch(tmp_path: Path, mismatch: str, expected: str):
+    relative = "src/v13_public_data_lock.py"
+    blob = "9ba735105a6bb6e944300812d425c04ac08df185"
+    path = tmp_path / relative
+    path.parent.mkdir()
+    path.write_text("synthetic parser", encoding="ascii")
+    source = SCRIPT.read_text(encoding="ascii")
+    function = source.split("    function Assert-ReviewedSourceBlob", 1)[1].split(
+        "    Assert-ReviewedSourceBlob 'scripts/v13_public_data_lock_execute.py'", 1
+    )[0]
+    quoted_root = str(tmp_path).replace("'", "''")
+    mock = f"""
+$repoRoot = '{quoted_root}'
+function git {{
+    param([Parameter(ValueFromRemainingArguments=$true)][object[]]$gitArguments)
+    $global:LASTEXITCODE = 0
+    if ($gitArguments[0] -eq 'rev-parse') {{ return '{'0' * 40 if mismatch == 'tree' else blob}' }}
+    if ($gitArguments[0] -eq 'hash-object') {{ return '{'0' * 40 if mismatch == 'worktree' else blob}' }}
+    throw 'UNEXPECTED_SYNTHETIC_GIT_CALL'
+}}
+function Assert-ReviewedSourceBlob{function}
+Assert-ReviewedSourceBlob '{relative}' '{blob}'
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", mock],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert expected in result.stderr, result.stderr
 
 
 @pytest.mark.skipif(shutil.which("powershell.exe") is None, reason="Windows PowerShell unavailable")

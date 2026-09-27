@@ -56,7 +56,10 @@ V13_AUTHORIZATION_BLOB_SHA1 = "ff00b49346153dfe7d506432d8358713bbd7fa87"
 V13_DELTA = ["et-xmlfile==2.0.0", "openpyxl==3.1.5"]
 REVIEWED_PROBE_BLOBS = {
     "scripts/v13_xlsx_readiness.py": (V13_REVIEWED_SHA, "e7c1da8c15f4c74dbdccd2686219653d66b6c2ab"),
-    "src/v13_public_data_lock.py": ("fbfe886254cf1ac053270857b7f188e83d948a75", "aa18f8f31b524d3e8543cf6b9a86c1d980087b7b"),
+    "src/v13_public_data_lock.py": (
+        "2f707a4980912543f771c7a68e449a87f2955458",
+        "9ba735105a6bb6e944300812d425c04ac08df185",
+    ),
     "scripts/v9_014_pdf_env_successor.py": (V13_REVIEWED_SHA, "0f60c6ad8519f89c51984231c6248d28e785271e"),
     "tests/fixtures/v9_014_synthetic_pdf_env_probe.pdf": (V13_REVIEWED_SHA, "96b5c60b9b8b63eeb3241f04f184edae7f14ccbf"),
 }

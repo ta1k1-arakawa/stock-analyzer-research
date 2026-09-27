@@ -109,10 +109,10 @@ def test_current_checker_binds_reviewed_safe_result(monkeypatch) -> None:
     assert checker.V13_PROMOTION_BLOB_SHA1 in calls
 
 
-def test_parser_probe_uses_issue_121_reviewed_git_object_and_worktree_blob(monkeypatch) -> None:
+def test_parser_probe_uses_issue_128_reviewed_git_object_and_worktree_blob(monkeypatch) -> None:
     parser_path = "src/v13_public_data_lock.py"
-    reviewed_sha = "fbfe886254cf1ac053270857b7f188e83d948a75"
-    reviewed_blob = "aa18f8f31b524d3e8543cf6b9a86c1d980087b7b"
+    reviewed_sha = "2f707a4980912543f771c7a68e449a87f2955458"
+    reviewed_blob = "9ba735105a6bb6e944300812d425c04ac08df185"
     assert checker.REVIEWED_PROBE_BLOBS[parser_path] == (reviewed_sha, reviewed_blob)
     calls: list[str] = []
 
