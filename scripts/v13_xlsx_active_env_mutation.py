@@ -212,24 +212,6 @@ def durable_json(path: Path, value: dict) -> None:
     os.replace(temp, path)
 
 
-ML_CHILD = r'''
-import json, math
-from lightgbm import LGBMRegressor
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
-X = [[0.,0.],[1.,1.],[2.,2.],[3.,3.]]
-y = [0.,1.,2.,3.]
-model = LGBMRegressor(n_estimators=1, random_state=0, n_jobs=1, verbosity=-1)
-model.fit(X,y)
-light = model.predict([[1.5,1.5]])
-scaler = StandardScaler().fit(X)
-ridge = Ridge().fit(scaler.transform(X),y)
-pred = ridge.predict(scaler.transform([[1.5,1.5]]))
-print(json.dumps({'lightgbm': len(light)==1 and math.isfinite(float(light[0])),
-                  'ridge': len(pred)==1 and math.isfinite(float(pred[0]))}))
-'''
-
-
 def postvalidate() -> None:
     observed = current._run_isolated_observer()
     require(observed["status"] == "PASS", "POST_OBSERVER_FAILED")
@@ -241,11 +223,6 @@ def postvalidate() -> None:
             len(child["packages"]) == 29, "POST_PACKAGE_SET_FAILED")
     require(current._validate_child_pdf_probe(child)["status"] == "PASS", "POST_PDF_FAILED")
     realization.inspect_candidate(current.CANONICAL_INTERPRETER, package_map)
-    ml = subprocess.run([str(current.CANONICAL_INTERPRETER), "-I", "-B", "-c", ML_CHILD],
-                        capture_output=True, text=True, env=realization.child_environment(), check=False)
-    require(ml.returncode == 0 and not ml.stderr.strip() and
-            json.loads(ml.stdout, object_pairs_hook=realization.unique) ==
-            {"lightgbm": True, "ridge": True}, "POST_ML_FAILED")
 
 
 def mutate(head: str) -> dict:
@@ -278,7 +255,7 @@ def mutate(head: str) -> dict:
                "wheel_manifest_sha256": freeze.MANIFEST_SHA256,
                "installed_package_count": 29, "delta_package_count": 2,
                "production_xlsx_readiness": "PASS", "pdf_readiness": "PASS",
-               "ml_readiness": "PASS", "network_requests": 0, "wheel_downloads": 0,
+               "network_requests": 0, "wheel_downloads": 0,
                "authority_consumed": True, "authorization_reusable": False,
                "current_authority_changed": False, "successor_promoted": False}
     durable_json(root / "receipt.json", receipt)

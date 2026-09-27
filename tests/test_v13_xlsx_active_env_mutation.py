@@ -1,4 +1,5 @@
 """Synthetic repository-only tests; never touch the active or candidate venv."""
+import ast
 import json
 import tempfile
 from pathlib import Path
@@ -79,7 +80,31 @@ def test_exact_29_metadata_and_pdf_gate():
              "page_count": m.current.PDF_PROBE_EXPECTED_PAGE_COUNT}
     assert m.current._validate_child_pdf_probe({"pdf_probe": probe})["status"] == "PASS"
     assert "probe_production_xlsx_route" in m.realization.CHILD
-    assert "lightgbm" in m.ML_CHILD and "Ridge" in m.ML_CHILD
+
+
+def test_postvalidation_keeps_package_pdf_and_production_xlsx_without_training():
+    source = Path(m.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    assert not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                   "training" in node.name.lower() for node in ast.walk(tree))
+    assert "ML_CHILD" not in source and ".fit(" not in source
+    assert '"ml_readiness"' not in source
+    assert ".fit(" not in m.realization.CHILD
+    assert "probe_production_xlsx_route" in m.realization.CHILD
+    package_map = dict(line.split("==", 1) for line in m.freeze.LOCK.read_text().splitlines())
+    child = {"packages": [{"name": name, "version": version}
+                          for name, version in package_map.items()]}
+    with patch.object(m.current, "_run_isolated_observer", return_value={"status": "PASS", "evidence": child}), \
+         patch.object(m.current, "_validate_child_identity", return_value={"status": "PASS"}) as identity, \
+         patch.object(m.current, "_validate_child_package_set", return_value={"status": "PASS"}) as packages, \
+         patch.object(m.current, "_validate_child_pdf_probe", return_value={"status": "PASS"}) as pdf, \
+         patch.object(m.realization, "inspect_candidate") as xlsx, \
+         patch.object(m.subprocess, "run", side_effect=AssertionError("unexpected child")):
+        m.postvalidate()
+    identity.assert_called_once_with(child)
+    packages.assert_called_once_with(package_map, child)
+    pdf.assert_called_once_with(child)
+    xlsx.assert_called_once_with(m.current.CANONICAL_INTERPRETER, package_map)
 
 
 def test_no_caller_selected_source_or_target_and_no_network_pip_flags():
