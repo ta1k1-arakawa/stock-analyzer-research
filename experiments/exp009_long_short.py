@@ -94,12 +94,12 @@ def main(cache: Path) -> None:
         res[f"{pname}_TOPIX"] = {"profit": round(float(tp) * BUDGET)}
     g = lambda p, n, c="base": res[f"{p}_{n}_{c}"]  # noqa: E731
     res["verdict"] = {
-        "1_LS_profit_positive_both_halves": all(g(p, "LS")["profit"] > 0 for p in ("first_half", "second_half")),
-        "2_LS_ratio_gt_R_both_halves": all(g(p, "LS")["annual_over_dd"] > g(p, "R")["annual_over_dd"] for p in ("first_half", "second_half")),
-        "3_full_stress_positive_and_ratio_gt_R": g("full", "LS", "stress")["profit"] > 0
-            and g("full", "LS", "stress")["annual_over_dd"] > g("full", "R", "stress")["annual_over_dd"],
+        "1_LS_profit_positive_both_halves": bool(all(g(p, "LS")["profit"] > 0 for p in ("first_half", "second_half"))),
+        "2_LS_ratio_gt_R_both_halves": bool(all(g(p, "LS")["annual_over_dd"] > g(p, "R")["annual_over_dd"] for p in ("first_half", "second_half"))),
+        "3_full_stress_positive_and_ratio_gt_R": bool(g("full", "LS", "stress")["profit"] > 0
+            and g("full", "LS", "stress")["annual_over_dd"] > g("full", "R", "stress")["annual_over_dd"]),
     }
-    res["promising"] = all(res["verdict"].values())
+    res["promising"] = bool(all(res["verdict"].values()))
     print(json.dumps(res, ensure_ascii=False, indent=1))
 
 
