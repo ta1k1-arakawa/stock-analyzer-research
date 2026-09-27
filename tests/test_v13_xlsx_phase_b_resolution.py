@@ -56,7 +56,7 @@ def test_bound_file_accepts_only_git_normalized_identity(tmp_path: Path, monkeyp
 
 
 def test_current_authority_and_unresolved_successor_spec() -> None:
-    authority = current.resolve_current_authority()
+    authority = current.resolve_historical_v10c_authority()
     assert authority["status"] == "PASS"
     assert authority["package_count"] == 27
     base = successor.validate_direct_spec()

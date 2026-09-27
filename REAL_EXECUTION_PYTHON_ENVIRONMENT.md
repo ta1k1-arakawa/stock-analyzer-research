@@ -559,21 +559,25 @@ while this state holds. `future_protected_execution_authorized` remains
 
 The V9_014 15-package generic checker and its lock remain preserved historical
 evidence and regression tooling. They are not the current authority for a
-future protected PRE_GATE. The reviewed V10C successor chain is the current
-canonical protected-environment authority: its final-freeze F9 review
-established `CANONICAL_FROZEN`, the successor lock has 27 exact packages,
-and the predecessor 20-package lock is retained only as predecessor
-provenance. Resolve and validate this distinction mechanically with
+future protected PRE_GATE. After Issue #111 receives its own GPT exact-SHA
+PASS, the V13 XLSX successor is the current protected-environment authority
+with exactly 29 packages. Its final promotion binds the #110-reviewed
+active-mutation safe result, the exact final lock, and the human approval.
+The F9-reviewed V10C 27-package chain remains historical predecessor
+provenance, including its earlier 20-package predecessor. Resolve this
+distinction mechanically with
 `scripts/check_current_protected_environment.py` before naming a checker in
 a protected task. If the repository later records a different reviewed
 current chain, this checker must fail closed until a separately reviewed
 implementation binds that transition; do not repoint the historical checker
 silently. Current-authority resolution is only one readiness component: it
 does not replace operation-specific reachable-dependency probes. The V12
-selector-compatible profile additionally requires the reviewed synthetic
-`pdfplumber` operational probe to PASS before `CURRENT_ENVIRONMENT_READY` can
-be true; future protected tasks must bind the probes applicable to their own
-post-gate execution path. The current checker performs the package and PDF
+selector-compatible profile requires the reviewed synthetic `pdfplumber`
+operational probe to PASS. The current V13 profile additionally requires the
+synthetic production XLSX route and exact `openpyxl==3.1.5` and
+`et-xmlfile==2.0.0` identities before `CURRENT_ENVIRONMENT_READY` can be
+true; future protected tasks must bind the probes applicable to their own
+post-gate execution path. The current checker performs package, PDF, and XLSX
 observation inside an exact-canonical-interpreter isolated child using `-I`,
 `-B`, controlled no-user-site/no-bytecode environment variables, no ambient
 `PYTHONPATH`, and explicit repository-file loading; parent validation fails

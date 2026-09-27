@@ -21,7 +21,7 @@ def _name(value: str) -> str:
 
 def validate_direct_spec() -> dict[str, str]:
     """Bind all existing pins exactly to the reviewed current authority."""
-    authority = current.resolve_current_authority()
+    authority = current.resolve_historical_v10c_authority()
     if authority["status"] != "PASS" or authority["package_count"] != 27:
         raise ValueError("CURRENT_27_PACKAGE_AUTHORITY_INVALID")
     base = authority["package_map"]

@@ -225,17 +225,20 @@ reviewed promotion/freeze chain in that Issue. Use:
 .venv-real-execution\Scripts\python.exe scripts/check_current_protected_environment.py
 ```
 
-The checker is no-network, no-private-data, and read-only. It resolves the
-current V10C canonical frozen authority (the 27-package successor lock) from
-the F9-reviewed Git tree and current project-state promotion fields, then
+The checker is no-network, no-private-data, and read-only. After exact-SHA
+GPT PASS of Issue #111's final promotion, it resolves the V13 29-package
+XLSX successor as current authority from the #110-reviewed mutation safe
+result, final promotion artifact, and project-state fields. The F9-reviewed
+V10C 27-package lock remains bound as historical predecessor. It then
 checks the exact canonical interpreter, Python `3.12.10`, and the live
 installed package identity through `importlib.metadata.distributions()` with
 normalized names, exact versions, exact cardinality, and duplicate rejection
 inside an isolated child launched by that exact interpreter with `-I` and
 `-B`. The child removes ambient `PYTHONPATH`/`PYTHONHOME` authority, disables
 user-site and bytecode, and loads repository-local probe code by explicit
-file path. It also runs the reviewed synthetic PDF operational probe for the
-V12 selector's reachable `pdfplumber` parser path. `pip freeze` presentation,
+file path. It also runs the reviewed synthetic PDF operational probe and the
+synthetic production XLSX parser route, requiring exact `openpyxl==3.1.5`
+and `et-xmlfile==2.0.0`. `pip freeze` presentation,
 including direct-reference lines, is not installed-identity authority.
 The parent fails closed on child launch/nonzero/schema/identity/package/probe
 failure. `check_current_protected_environment.py` resolving this current

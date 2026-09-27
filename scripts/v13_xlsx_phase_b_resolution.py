@@ -141,7 +141,7 @@ def preflight(head: str, *, remote: bool = True) -> dict[str, str]:
     _approval(record)
     _bound_file(head, record["current_authority_lock"])
     _bound_file(head, record["successor_direct_spec"])
-    authority = current.resolve_current_authority()
+    authority = current.resolve_historical_v10c_authority()
     _require(authority["status"] == "PASS" and authority["package_count"] == 27, "CURRENT_AUTHORITY_INVALID")
     _require(len(successor.validate_direct_spec()) == 27, "DIRECT_SPEC_INVALID")
     _require(current.run_current_readiness()["CURRENT_ENVIRONMENT_READY"], "CURRENT_ENVIRONMENT_INVALID")

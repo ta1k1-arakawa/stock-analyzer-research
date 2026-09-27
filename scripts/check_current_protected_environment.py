@@ -3,14 +3,13 @@
 This checker is deliberately separate from ``check_real_execution_env.py``.
 The latter remains the historical V9_014 generic 15-package checker and is
 kept independently testable for provenance and regression purposes.  This
-module resolves the current V10C 27-package authority from its reviewed
-promotion/final-freeze chain and never treats the historical checker or its
-lock as the current authority.
+module retains the reviewed V10C 27-package chain as predecessor provenance
+and resolves the V13 29-package final promotion as current authority.
 
 The checker is no-network, no-private-data, and read-only. It launches an
 isolated child through the exact canonical interpreter; that child observes
 installed package identity through ``importlib.metadata`` and runs the
-reviewed synthetic PDF operational probe. It never installs packages, opens
+reviewed synthetic PDF and production XLSX operational probes. It never installs packages, opens
 research payloads, or consumes a gate. A missing, ambiguous, stale, or
 contradictory authority fails closed.
 """
@@ -42,6 +41,25 @@ FINAL_FREEZE_EVIDENCE_PATH = (
 RESOLUTION_PROMOTION_PATH = (
     REPO_ROOT / "V10C_T0_CANONICAL_ML_ENVIRONMENT_SUCCESSOR_RESOLUTION_PROMOTION.json"
 )
+V13_FINAL_LOCK_PATH = REPO_ROOT / "V13_PROTECTED_XLSX_ENVIRONMENT_SUCCESSOR_LOCK.txt"
+V13_CANDIDATE_LOCK_PATH = REPO_ROOT / "V13_PROTECTED_XLSX_ENVIRONMENT_SUCCESSOR_LOCK_CANDIDATE.txt"
+V13_PROMOTION_PATH = REPO_ROOT / "docs/v13/V13_XLSX_SUCCESSOR_FINAL_CURRENT_AUTHORITY_PROMOTION.json"
+V13_SAFE_RESULT_PATH = REPO_ROOT / "docs/v13/V13_XLSX_SUCCESSOR_ACTIVE_ENV_MUTATION_SAFE_RESULT.json"
+V13_AUTHORIZATION_PATH = REPO_ROOT / "docs/v13/V13_XLSX_SUCCESSOR_ACTIVE_ENV_MUTATION_AUTHORIZATION.json"
+V13_REVIEWED_SHA = "2adbb7d6d182b62d97ab59f2af3d7a13776f48ee"
+V13_REVIEWED_PARENT_SHA = "3b351fe13ab8b81bb6f8b295b3d24f44c4bd693c"
+V13_LOCK_BLOB_SHA1 = "dfe440dc6398dc3b1a2dd31c81047e4209e61536"
+V13_LOCK_SHA256 = "8be6d6ab9ab7602017d758ea828e9e27dc46342d0f27fb8ebe44565010e13aba"
+V13_PROMOTION_BLOB_SHA1 = "1f68d9c819ce1b7daab59babb8929885de622ef9"
+V13_SAFE_RESULT_BLOB_SHA1 = "a90b3e3e2738c4c304755c16221a96e48336010c"
+V13_AUTHORIZATION_BLOB_SHA1 = "ff00b49346153dfe7d506432d8358713bbd7fa87"
+V13_DELTA = ["et-xmlfile==2.0.0", "openpyxl==3.1.5"]
+REVIEWED_PROBE_BLOBS = {
+    "scripts/v13_xlsx_readiness.py": "e7c1da8c15f4c74dbdccd2686219653d66b6c2ab",
+    "src/v13_public_data_lock.py": "06b634e4f5f95b167a7b9ed595ae38544d8ddb8c",
+    "scripts/v9_014_pdf_env_successor.py": "0f60c6ad8519f89c51984231c6248d28e785271e",
+    "tests/fixtures/v9_014_synthetic_pdf_env_probe.pdf": "96b5c60b9b8b63eeb3241f04f184edae7f14ccbf",
+}
 
 CURRENT_AUTHORITY_REVIEWED_SHA = "92cc4a964af798f9543155e32eb83a12e7352151"
 CURRENT_AUTHORITY_REVIEWED_PARENT_SHA = "d574015cb148f9e172d73b2ad74b5f99e02ff5ea"
@@ -68,7 +86,7 @@ PDF_PROBE_EXPECTED_FIXTURE_SHA256 = "5eecb758a50e829af16bd42833f89a8329bfaaaa561
 PDF_PROBE_REQUIRED_PDFPLUMBER_VERSION = "0.11.10"
 PDF_PROBE_EXPECTED_PAGE_COUNT = 1
 PDF_PROBE_PASS = "SYNTHETIC_PDF_PROBE_PASS"
-ISOLATED_CHILD_SCHEMA = "V12_CURRENT_PROTECTED_ENVIRONMENT_ISOLATED_OBSERVER_V1"
+ISOLATED_CHILD_SCHEMA = "V13_CURRENT_PROTECTED_ENVIRONMENT_ISOLATED_OBSERVER_V1"
 ISOLATED_CHILD_TOP_KEYS = frozenset(
     {
         "schema_version",
@@ -87,11 +105,13 @@ ISOLATED_CHILD_TOP_KEYS = frozenset(
         "package_observation_status",
         "package_failure",
         "pdf_probe",
+        "xlsx_probe",
     }
 )
 ISOLATED_CHILD_PDF_KEYS = frozenset(
     {"status", "fixture_sha256", "pdfplumber_version", "page_count"}
 )
+ISOLATED_CHILD_XLSX_KEYS = frozenset({"status", "openpyxl_version", "et_xmlfile_version"})
 
 _PINNED_LINE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)==(?P<version>[^\s#]+)$")
 _KEY_LINE = re.compile(r"^(?P<key>[A-Z0-9_]+)=(?P<value>.*)$")
@@ -230,7 +250,7 @@ def _current_chain_state_ok(values: dict[str, list[str]]) -> tuple[bool, str | N
     return True, None
 
 
-def resolve_current_authority(
+def resolve_historical_v10c_authority(
     *,
     repo_root: Path = REPO_ROOT,
     state_path: Path = PROJECT_STATE_PATH,
@@ -328,6 +348,138 @@ def resolve_current_authority(
     }
 
 
+def _unique_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("DUPLICATE_JSON_KEY")
+        result[key] = value
+    return result
+
+
+def resolve_current_authority(
+    *,
+    repo_root: Path = REPO_ROOT,
+    state_path: Path = PROJECT_STATE_PATH,
+    lock_path: Path = V13_FINAL_LOCK_PATH,
+    promotion_path: Path = V13_PROMOTION_PATH,
+    git_blob_reader: GitBlobReader = _git_blob_bytes,
+) -> dict[str, Any]:
+    """Bind V13 to the reviewed V10C predecessor and exact #110 safe result."""
+
+    predecessor = resolve_historical_v10c_authority(repo_root=repo_root, state_path=state_path)
+    if predecessor["status"] != "PASS" or predecessor["package_count"] != 27:
+        return {"status": "FAIL", "reason": "HISTORICAL_PREDECESSOR_INVALID"}
+    if _git_commit_parent(repo_root, V13_REVIEWED_SHA) != V13_REVIEWED_PARENT_SHA:
+        return {"status": "FAIL", "reason": "V13_REVIEWED_PARENT_MISMATCH"}
+    try:
+        values = _state_values(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return {"status": "FAIL", "reason": "CURRENT_AUTHORITY_STATE_UNREADABLE"}
+    expected_state = {
+        "CURRENT_PROTECTED_ENVIRONMENT_STUDY": "V13_PROTECTED_XLSX_ENVIRONMENT_SUCCESSOR",
+        "CURRENT_PROTECTED_ENVIRONMENT_PACKAGE_COUNT": "29",
+        "CURRENT_PROTECTED_ENVIRONMENT_LOCK_BLOB": V13_LOCK_BLOB_SHA1,
+        "CURRENT_PROTECTED_ENVIRONMENT_PROMOTION_BLOB": V13_PROMOTION_BLOB_SHA1,
+        "V13_XLSX_SUCCESSOR_PROMOTED": "true",
+        "V13_XLSX_PREDECESSOR_27_PACKAGE_AUTHORITY_HISTORICAL": "true",
+        "V13_XLSX_ISSUE110_GPT_REVIEWED_SHA": V13_REVIEWED_SHA,
+        "V13_XLSX_ISSUE110_GPT_REVIEW_COMMENT_ID": "5851650708",
+        "V13_XLSX_FINAL_PROMOTION_REVIEW_STATUS": "AWAITING_GPT_EXACT_SHA_REVIEW",
+        "V13_XLSX_FUTURE_PROFITABILITY_ESTABLISHED": "false",
+    }
+    for key, expected in expected_state.items():
+        actual, reason = _one_state_value(values, key)
+        if reason or actual != expected:
+            return {"status": "FAIL", "reason": reason or "CURRENT_AUTHORITY_STATE_VALUE_MISMATCH"}
+
+    paths = {
+        "predecessor_lock": (CURRENT_AUTHORITY_LOCK_PATH, CURRENT_LOCK_PATH, CURRENT_AUTHORITY_LOCK_BLOB_SHA1),
+        "candidate_lock": (V13_CANDIDATE_LOCK_PATH.name, V13_CANDIDATE_LOCK_PATH, V13_LOCK_BLOB_SHA1),
+        "final_lock": (V13_FINAL_LOCK_PATH.name, lock_path, V13_LOCK_BLOB_SHA1),
+        "promotion": (V13_PROMOTION_PATH.relative_to(REPO_ROOT).as_posix(), promotion_path, V13_PROMOTION_BLOB_SHA1),
+        "safe_result": (V13_SAFE_RESULT_PATH.relative_to(REPO_ROOT).as_posix(), V13_SAFE_RESULT_PATH, V13_SAFE_RESULT_BLOB_SHA1),
+        "authorization": (V13_AUTHORIZATION_PATH.relative_to(REPO_ROOT).as_posix(), V13_AUTHORIZATION_PATH, V13_AUTHORIZATION_BLOB_SHA1),
+    }
+    raw: dict[str, bytes] = {}
+    for label, (relative_name, path, expected_blob) in paths.items():
+        ref = f"{V13_REVIEWED_SHA}:{relative_name}" if label in {"safe_result", "authorization", "candidate_lock", "predecessor_lock"} else expected_blob
+        blob = git_blob_reader(repo_root, ref)
+        if blob is None or _git_blob_sha1(blob) != expected_blob:
+            return {"status": "FAIL", "reason": "V13_AUTHORITY_GIT_BLOB_MISMATCH", "artifact": label}
+        if not path.is_file() or _working_blob_sha1(repo_root, relative_name, path) != expected_blob:
+            return {"status": "FAIL", "reason": "V13_AUTHORITY_WORKING_BLOB_MISMATCH", "artifact": label}
+        raw[label] = blob
+    for relative_name, expected_blob in REVIEWED_PROBE_BLOBS.items():
+        blob = git_blob_reader(repo_root, f"{V13_REVIEWED_SHA}:{relative_name}")
+        if blob is None or _git_blob_sha1(blob) != expected_blob:
+            return {"status": "FAIL", "reason": "V13_REVIEWED_PROBE_BLOB_MISMATCH", "artifact": relative_name}
+        if _working_blob_sha1(repo_root, relative_name, repo_root / relative_name) != expected_blob:
+            return {"status": "FAIL", "reason": "V13_WORKING_PROBE_BLOB_MISMATCH", "artifact": relative_name}
+    if raw["candidate_lock"] != raw["final_lock"] or hashlib.sha256(raw["final_lock"]).hexdigest() != V13_LOCK_SHA256:
+        return {"status": "FAIL", "reason": "V13_FINAL_LOCK_IDENTITY_MISMATCH"}
+    try:
+        final_map, invalid, duplicates = _parse_pinned_lines(raw["final_lock"].decode("ascii"))
+        promotion = json.loads(raw["promotion"], object_pairs_hook=_unique_json_pairs)
+        safe = json.loads(raw["safe_result"], object_pairs_hook=_unique_json_pairs)
+    except (UnicodeError, ValueError, TypeError):
+        return {"status": "FAIL", "reason": "V13_AUTHORITY_SCHEMA_INVALID"}
+    if invalid or duplicates or len(final_map) != 29 or any(final_map.get(k) != v for k, v in predecessor["package_map"].items()):
+        return {"status": "FAIL", "reason": "V13_FINAL_PACKAGE_SET_INVALID"}
+    delta = sorted(f"{key}=={value}" for key, value in final_map.items() if key not in predecessor["package_map"])
+    if delta != V13_DELTA or final_map.get("openpyxl") != "3.1.5" or final_map.get("et-xmlfile") != "2.0.0":
+        return {"status": "FAIL", "reason": "V13_SUCCESSOR_DELTA_INVALID"}
+    lock_binding = lambda name, blob, sha, count: {"path": name, "git_blob_sha1": blob, "sha256": sha, "package_count": count}
+    required = {
+        "schema_version": "V13_XLSX_SUCCESSOR_FINAL_CURRENT_AUTHORITY_PROMOTION_V1",
+        "artifact_role": "FINAL_CURRENT_PROTECTED_ENVIRONMENT_AUTHORITY_PROMOTION",
+        "authoritative_branch": "v13-conditional-cross-sectional-short-horizon",
+        "github_issue": 111,
+        "starting_head": V13_REVIEWED_SHA,
+        "predecessor_issue": 110,
+        "predecessor_gpt_result": "PASS",
+        "predecessor_gpt_reviewed_sha": V13_REVIEWED_SHA,
+        "predecessor_gpt_review_comment_id": 5851650708,
+        "source_safe_result_comment_id": 5851490615,
+        "source_safe_result_path": paths["safe_result"][0],
+        "source_safe_result_git_blob_sha1": V13_SAFE_RESULT_BLOB_SHA1,
+        "human_promotion_approval_comment_id": 5851057309,
+        "active_mutation_authorization_blob": V13_AUTHORIZATION_BLOB_SHA1,
+        "predecessor_lock": lock_binding(CURRENT_AUTHORITY_LOCK_PATH, CURRENT_AUTHORITY_LOCK_BLOB_SHA1, CURRENT_AUTHORITY_LOCK_SHA256, 27),
+        "candidate_lock": lock_binding(V13_CANDIDATE_LOCK_PATH.name, V13_LOCK_BLOB_SHA1, V13_LOCK_SHA256, 29),
+        "final_lock": lock_binding(V13_FINAL_LOCK_PATH.name, V13_LOCK_BLOB_SHA1, V13_LOCK_SHA256, 29),
+        "candidate_final_lock_bytes_identical": True,
+        "successor_delta": V13_DELTA,
+        "successor_delta_package_count": 2,
+        "wheel_manifest_sha256": "5665dbd50d13dc445792d031db7866e4f9e8e71244ecbddbf4187464ccafa8c2",
+        "source_mutation_status": "MUTATED_VALIDATED_NOT_YET_PROMOTED",
+        "source_mutation_authority_consumed": True,
+        "source_mutation_authorization_reusable": False,
+        "source_installed_package_count": 29,
+        "source_pdf_readiness": "PASS",
+        "source_production_xlsx_readiness": "PASS",
+        "predecessor_authority_historical": True,
+        "current_authority_changed": True,
+        "successor_promoted": True,
+        "promotion_status_at_creation": "AWAITING_GPT_EXACT_SHA_REVIEW",
+        "promotion_effective_only_after_gpt_exact_sha_pass": True,
+        "downstream_research_trading_authorized": False,
+        "future_profitability_established": False,
+    }
+    zero_fields = [
+        "network_requests", "package_index_requests", "wheel_downloads", "package_installations",
+        "active_environment_mutations", "machine_local_receipt_reads", "phase_b_reads",
+        "realized_candidate_reads", "private_reads", "jpx_yahoo_requests", "model_fits", "backtests",
+    ]
+    required.update({f"repository_task_{key}": 0 for key in zero_fields})
+    required.update({f"repository_task_{key}": False for key in ("selected500", "aq_execution", "paper_trading", "real_trading")})
+    if type(promotion) is not dict or set(promotion) != set(required) or any(type(promotion[k]) is not type(v) or promotion[k] != v for k, v in required.items()):
+        return {"status": "FAIL", "reason": "V13_PROMOTION_BINDING_MISMATCH"}
+    if not isinstance(safe, dict) or safe.get("status") != "MUTATED_VALIDATED_NOT_YET_PROMOTED" or safe.get("authority_consumed") is not True or safe.get("authorization_reusable") is not False or safe.get("installed_package_count") != 29 or safe.get("pdf_readiness") != "PASS" or safe.get("production_xlsx_readiness") != "PASS" or safe.get("successor_promoted") is not False:
+        return {"status": "FAIL", "reason": "V13_SAFE_RESULT_BINDING_MISMATCH"}
+    return {"status": "PASS", "study": "V13_PROTECTED_XLSX_ENVIRONMENT_SUCCESSOR", "authority_state": "CANONICAL_FROZEN_AFTER_GPT_PASS", "reviewed_sha": V13_REVIEWED_SHA, "lock_path": V13_FINAL_LOCK_PATH.name, "lock_sha256": V13_LOCK_SHA256, "package_count": 29, "package_map": final_map, "historical_predecessor_package_count": 27, "historical_predecessor_lock_blob_sha1": CURRENT_AUTHORITY_LOCK_BLOB_SHA1}
+
+
 def check_interpreter_identity() -> dict[str, Any]:
     actual = Path(sys.executable).resolve(strict=False)
     expected = CANONICAL_INTERPRETER.resolve(strict=False)
@@ -406,11 +558,11 @@ import sys
 import sysconfig
 from pathlib import Path
 
-SCHEMA = "V12_CURRENT_PROTECTED_ENVIRONMENT_ISOLATED_OBSERVER_V1"
+SCHEMA = "V13_CURRENT_PROTECTED_ENVIRONMENT_ISOLATED_OBSERVER_V1"
 PDF_PASS = "SYNTHETIC_PDF_PROBE_PASS"
 
 
-def emit(status, packages, package_status, package_failure, pdf_probe):
+def emit(status, packages, package_status, package_failure, pdf_probe, xlsx_probe):
     result = {
         "schema_version": SCHEMA,
         "status": status,
@@ -428,6 +580,7 @@ def emit(status, packages, package_status, package_failure, pdf_probe):
         "package_observation_status": package_status,
         "package_failure": package_failure,
         "pdf_probe": pdf_probe,
+        "xlsx_probe": xlsx_probe,
     }
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
@@ -436,10 +589,15 @@ def empty_pdf_probe():
     return {"status": "FAIL", "fixture_sha256": None, "pdfplumber_version": None, "page_count": None}
 
 
+def empty_xlsx_probe():
+    return {"status": "FAIL", "openpyxl_version": None, "et_xmlfile_version": None}
+
+
 packages = []
 package_status = "PASS"
 package_failure = None
 pdf_probe = empty_pdf_probe()
+xlsx_probe = empty_xlsx_probe()
 try:
     if len(sys.argv) != 2:
         raise ValueError("REPOSITORY_ROOT_ARGUMENT_INVALID")
@@ -478,12 +636,31 @@ try:
         "pdfplumber_version": getattr(probe_result, "observed_pdfplumber_version", None),
         "page_count": getattr(probe_result, "observed_page_count", None),
     }
+    xlsx_module_path = repository_root / "scripts" / "v13_xlsx_readiness.py"
+    if not xlsx_module_path.is_file():
+        raise OSError("REVIEWED_XLSX_PROBE_MISSING")
+    xlsx_spec = importlib.util.spec_from_file_location("_v13_reviewed_xlsx_probe", xlsx_module_path)
+    if xlsx_spec is None or xlsx_spec.loader is None:
+        raise ImportError("REVIEWED_XLSX_PROBE_LOAD_FAILED")
+    xlsx_module = importlib.util.module_from_spec(xlsx_spec)
+    sys.modules[xlsx_spec.name] = xlsx_module
+    xlsx_spec.loader.exec_module(xlsx_module)
+    sys.path.insert(0, str(repository_root))
+    openpyxl_version = importlib.metadata.version("openpyxl")
+    et_xmlfile_version = importlib.metadata.version("et-xmlfile")
+    xlsx_probe = {
+        "status": "PASS" if xlsx_module.probe_production_xlsx_route() else "FAIL",
+        "openpyxl_version": openpyxl_version,
+        "et_xmlfile_version": et_xmlfile_version,
+    }
 except Exception:
     if package_status == "PASS":
         package_status = "FAIL"
         package_failure = "ISOLATED_OBSERVER_EXCEPTION"
     if pdf_probe["status"] == "FAIL" and pdf_probe["fixture_sha256"] is None:
         pdf_probe = empty_pdf_probe()
+    if xlsx_probe["status"] == "FAIL":
+        xlsx_probe = empty_xlsx_probe()
 
 identity_pass = (
     platform.python_implementation() == "CPython"
@@ -492,8 +669,8 @@ identity_pass = (
     and platform.machine() == "AMD64"
     and sysconfig.get_platform() == "win-amd64"
 )
-overall_status = "PASS" if identity_pass and package_status == "PASS" and pdf_probe["status"] == PDF_PASS else "FAIL"
-emit(overall_status, packages, package_status, package_failure, pdf_probe)
+overall_status = "PASS" if identity_pass and package_status == "PASS" and pdf_probe["status"] == PDF_PASS and xlsx_probe == {"status": "PASS", "openpyxl_version": "3.1.5", "et_xmlfile_version": "2.0.0"} else "FAIL"
+emit(overall_status, packages, package_status, package_failure, pdf_probe, xlsx_probe)
 '''
 
 
@@ -556,6 +733,14 @@ def _validate_isolated_child_json(value: Any) -> tuple[dict[str, Any] | None, st
             return None, "CURRENT_AUTHORITY_CHILD_PDF_TYPES_INVALID"
     if pdf_probe["page_count"] is not None and (type(pdf_probe["page_count"]) is not int or isinstance(pdf_probe["page_count"], bool)):
         return None, "CURRENT_AUTHORITY_CHILD_PDF_TYPES_INVALID"
+    xlsx_probe = value.get("xlsx_probe")
+    if not isinstance(xlsx_probe, dict) or set(xlsx_probe) != ISOLATED_CHILD_XLSX_KEYS:
+        return None, "CURRENT_AUTHORITY_CHILD_XLSX_SCHEMA_INVALID"
+    if not isinstance(xlsx_probe["status"], str):
+        return None, "CURRENT_AUTHORITY_CHILD_XLSX_TYPES_INVALID"
+    for key in ("openpyxl_version", "et_xmlfile_version"):
+        if xlsx_probe[key] is not None and not isinstance(xlsx_probe[key], str):
+            return None, "CURRENT_AUTHORITY_CHILD_XLSX_TYPES_INVALID"
     return value, None
 
 
@@ -667,6 +852,13 @@ def _validate_child_pdf_probe(evidence: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_child_xlsx_probe(evidence: dict[str, Any]) -> dict[str, Any]:
+    probe = evidence["xlsx_probe"]
+    if probe != {"status": "PASS", "openpyxl_version": "3.1.5", "et_xmlfile_version": "2.0.0"}:
+        return {"status": "FAIL", "reason": "CURRENT_AUTHORITY_XLSX_PROBE_FAILED"}
+    return {"status": "PASS", "openpyxl_version": "3.1.5", "et_xmlfile_version": "2.0.0"}
+
+
 def run_current_readiness() -> dict[str, Any]:
     authority = resolve_current_authority()
     interpreter = check_interpreter_identity()
@@ -680,10 +872,12 @@ def run_current_readiness() -> dict[str, Any]:
         child_identity = _validate_child_identity(evidence)
         packages = _validate_child_package_set(authority["package_map"], evidence)
         pdf_probe = _validate_child_pdf_probe(evidence)
+        xlsx_probe = _validate_child_xlsx_probe(evidence)
     else:
         child_identity = {"status": "NOT_RUN", "reason": isolated["reason"]}
         packages = {"status": "NOT_RUN", "reason": isolated["reason"]}
         pdf_probe = {"status": "NOT_RUN", "reason": isolated["reason"]}
+        xlsx_probe = {"status": "NOT_RUN", "reason": isolated["reason"]}
     ready = (
         authority["status"] == "PASS"
         and interpreter["status"] == "PASS"
@@ -691,6 +885,7 @@ def run_current_readiness() -> dict[str, Any]:
         and child_identity["status"] == "PASS"
         and packages["status"] == "PASS"
         and pdf_probe["status"] == "PASS"
+        and xlsx_probe["status"] == "PASS"
     )
     return {
         "CURRENT_PROTECTED_ENVIRONMENT_AUTHORITY": authority,
@@ -699,6 +894,7 @@ def run_current_readiness() -> dict[str, Any]:
         "ISOLATED_CHILD_IDENTITY": child_identity,
         "LIVE_PACKAGE_SET": packages,
         "PDF_OPERATIONAL_PROBE": pdf_probe,
+        "PRODUCTION_XLSX_OPERATIONAL_PROBE": xlsx_probe,
         "CURRENT_ENVIRONMENT_READY": ready,
         "REAL_NETWORK_REQUESTS": 0,
         "PRIVATE_READS": 0,

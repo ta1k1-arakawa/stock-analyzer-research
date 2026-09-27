@@ -47,7 +47,7 @@ def _unique(pairs: list[tuple[str, object]]) -> dict:
 
 
 def validate_freeze(*, lock_path: Path = LOCK, record_path: Path = RECORD) -> dict:
-    authority = current.resolve_current_authority()
+    authority = current.resolve_historical_v10c_authority()
     _require(authority["status"] == "PASS" and authority["package_count"] == 27,
              "CURRENT_AUTHORITY_INVALID")
     _require(authority["historical_predecessor_package_count"] == 20,
