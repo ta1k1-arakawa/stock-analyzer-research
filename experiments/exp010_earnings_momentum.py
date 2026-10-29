@@ -124,7 +124,11 @@ def revision_momentum_scores(fins, dates, codes) -> pd.DataFrame:
     disc_date in (d - 90 days, d]. Ranked to [0, 1] each day; 0.5 = neutral.
     """
     rec = _as_records(fins)
-    rec["rev_sign"] = np.sign(rec.groupby("code")["np_forecast"].diff())
+    # NOTE: the first disclosure per code has diff() = NaN; fillna(0) BEFORE
+    # filtering, otherwise NaN != 0 keeps those rows and np.cumsum() below
+    # propagates NaN through the whole momentum series (found 2026-10-29:
+    # A and B silently produced zero trades).
+    rec["rev_sign"] = np.sign(rec.groupby("code")["np_forecast"].diff().fillna(0.0))
     rev = rec[rec["rev_sign"] != 0].copy()  # drop first disclosure / unchanged
     dates = pd.DatetimeIndex(dates)
     mom = pd.DataFrame(0.0, index=dates, columns=list(codes))
@@ -280,7 +284,11 @@ def main(cache: Path) -> None:
             }
         return out
 
-    print(json.dumps({"res": res, "verdict": verdict()}, ensure_ascii=False))
+    diag = {
+        "mom_non_nan_share": float(mom.notna().to_numpy().mean()),
+        "mom_mean_row_std": float(mom.std(axis=1).mean()),
+    }
+    print(json.dumps({"res": res, "verdict": verdict(), "diag": diag}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
