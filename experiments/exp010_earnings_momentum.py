@@ -6,6 +6,10 @@ Amendment 1: docs/experiments/EXP-010_AMENDMENT_1.md
     np_forecast (company earnings-guidance) revision momentum, because the
     cached financial summary has no operating-profit field.
   - Lot rounding stays OFF to match EXP-009 (no rounding exists in EXP-003..009).
+Amendment 2: docs/experiments/EXP-010_AMENDMENT_2.md
+  - Adapter fix only: _as_records() now maps the RAW J-Quants v2 record
+    schema (DiscDate/DiscTime/FNP/NxFNp) via EXP-003's forecast rule.
+    No change to the hypothesis, variants, criteria, periods or costs.
 
 Design (incremental test, everything else identical to EXP-009 S):
   - S : EXP-009 long-short on the composite score (B/P rank + forecast ROE rank),
@@ -23,9 +27,10 @@ Usage:
 ADAPTER NOTES (check these if the script fails in the local environment):
   - E3.load(cache) must return (topix, panel, fins) like in EXP-003/009, with
     panel["O"]/panel["C"] as DataFrames indexed by trading date.
-  - `fins` is normalized by _as_records(); it handles a DataFrame, a
-    dict of code -> list[dict], or a list of dicts, as long as the records
-    carry code / disc_date / np_forecast (subset of FUND_FIELDS).
+  - `fins` is the dict code -> list of RAW J-Quants v2 records returned by
+    E3.load() (fields: DiscDate / DiscTime / DocType / CurPerType / FNP /
+    NxFNp). _as_records() maps them to code / disc_date / np_forecast using
+    EXP-003's own forecast-selection rule (see Amendment 2).
   - E9.simulate(score, o, c_ff, start, end, cost, carry, long_frac, short_frac)
     and E9.stats(equity_series) are reused unchanged from EXP-009 so that
     variant A and the S baseline run on the identical engine.
@@ -58,25 +63,56 @@ MOM_WINDOW_DAYS = 90  # revision lookback window for the momentum leg
 # ----------------------------------------------------------------------------
 # earnings-momentum leg (point-in-time, from cached financial summary)
 # ----------------------------------------------------------------------------
-def _as_records(fins) -> pd.DataFrame:
-    """Normalize the cached financial-summary object to code/disc_date/np_forecast rows."""
-    if isinstance(fins, pd.DataFrame):
-        df = fins
-    elif isinstance(fins, dict):
-        rows = []
+def _forecast_value(r: dict) -> float:
+    """EXP-003's forecast-selection rule, verbatim: NxFNp for FY financial
+    statements, FNP otherwise."""
+    if r.get("CurPerType") == "FY" and "FinancialStatements" in str(r.get("DocType", "")):
+        v = r.get("NxFNp")
+    else:
+        v = r.get("FNP")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _iter_code_records(fins):
+    """Yield (code, raw record) pairs from the shapes E3.load() can return."""
+    if isinstance(fins, dict):
         for code, recs in fins.items():
             for r in recs:
-                row = dict(r)
-                row.setdefault("code", code)
-                rows.append(row)
-        df = pd.DataFrame(rows)
+                yield str(code), r
+    elif isinstance(fins, pd.DataFrame):
+        for _, row in fins.iterrows():
+            r = row.to_dict()
+            yield str(r.get("Code", r.get("code"))), r
     else:  # list of dicts
-        df = pd.DataFrame(list(fins))
-    df = df.copy()
-    df["disc_date"] = pd.to_datetime(df["disc_date"])
-    df["np_forecast"] = pd.to_numeric(df["np_forecast"], errors="coerce")
-    out = df[["code", "disc_date", "np_forecast"]].dropna()
-    return out.sort_values(["code", "disc_date"]).reset_index(drop=True)
+        for r in fins:
+            yield str(r.get("Code", r.get("code"))), r
+
+
+def _as_records(fins) -> pd.DataFrame:
+    """Normalize the cached financial summary to code/disc_date/np_forecast rows.
+
+    The cache holds RAW J-Quants v2 records (DiscDate / DiscTime / DocType /
+    CurPerType / FNP / NxFNp), not the normalized free-data schema. Rows are
+    ordered by (code, DiscDate, DiscTime) — EXP-003's own ordering — so that
+    consecutive-disclosure diffs in revision_momentum_scores() compare the
+    same forecast series EXP-003 uses.
+    """
+    rows = []
+    for code, r in _iter_code_records(fins):
+        rows.append({
+            "code": code,
+            "disc_date": r.get("DiscDate"),
+            "disc_time": str(r.get("DiscTime") or ""),
+            "np_forecast": _forecast_value(r),
+        })
+    df = pd.DataFrame(rows)
+    df["disc_date"] = pd.to_datetime(df["disc_date"], errors="coerce")
+    out = df[["code", "disc_date", "disc_time", "np_forecast"]].dropna(
+        subset=["disc_date", "np_forecast"])
+    return out.sort_values(["code", "disc_date", "disc_time"]).reset_index(drop=True)
 
 
 def revision_momentum_scores(fins, dates, codes) -> pd.DataFrame:
