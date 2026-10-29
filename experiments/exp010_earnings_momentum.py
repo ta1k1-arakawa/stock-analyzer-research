@@ -219,7 +219,7 @@ def simulate_monthly(mom, o, c_ff, dates, start, end, cost, carry, n_names=N_NAM
         # daily short-carry accrual on entry notional
         cash -= sum(sh * ep * carry_d for _j, (sh, ep) in shorts.items())
         equity[t] = cash + lv + sv
-    return equity
+    return equity[s : e + 1]
 
 
 # ----------------------------------------------------------------------------
