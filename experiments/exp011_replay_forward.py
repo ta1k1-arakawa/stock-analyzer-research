@@ -17,6 +17,12 @@ How it works:
     (so the first orders are decided exactly like a campaign starting on
     the window's first day) through the window end, slicing panels to a
     rolling ~560-day warmup so per-day signal computation stays fast;
+  - patches F4.due_tranches to count trading days on the FULL price
+    calendar: the stock implementation counts within the panel it is
+    handed, which the rolling slice corrupts once the slice start passes
+    START (first run: rotation degraded from 2023-07-19 — see Amendment 1
+    in docs/experiments/EXP-011_PLAN.md). Semantics on a full-history
+    panel (what the live `step` passes) are unchanged;
   - reports per-portfolio stats from the scratch ledger, using the same
     annualisation as EXP-009's stats() with the forward budget (¥400,000).
 
@@ -108,6 +114,21 @@ def main(start: str, end: str) -> None:
     # so stub its scorer (the frozen model needs lightgbm, absent here). The
     # stubbed ranking is never used: orders are generated only for PORTFOLIOS.
     F4.model_scores = lambda feats, ok, d: pd.Series(dtype=float)
+    # due_tranches counts trading days since START within the panel it is
+    # handed; the rolling 560-day slice below would freeze that count once
+    # the slice start passes START (first run: tranches_due degraded from
+    # 2023-07-19 — same tranche due for weeks, long empty stretches).
+    # Count on the full price calendar instead; identical to the stock
+    # function when the panel covers the full history, as in live `step`.
+    def due_full_calendar(day, trading_days=None):
+        if day < F4.START:
+            return []
+        i = int(all_dates.searchsorted(day)) - int(all_dates.searchsorted(F4.START))
+        if i == 0:
+            return list(range(F4.N_TRANCHES))
+        return [(i % F4.HOLD_DAYS) // 2] if i % 2 == 0 else []
+
+    F4.due_tranches = due_full_calendar
     assert F4.FWD != FD.FWD, "scratch dir must differ from the live forward dir"
 
     (SCRATCH / "state.json").write_text(

@@ -1,7 +1,8 @@
 # EXP-011 PLAN — replay verification of the forward implementation (A and S)
 
 - Date: 2026-10-29
-- Status: prepared, awaiting user approval to commit
+- Status: pushed (commit 215f4b15); first run completed 2026-10-29;
+  Amendment 1 (harness fix) applied before the re-run — see below
 - Script: `experiments/exp011_replay_forward.py`
 
 ## Purpose
@@ -58,7 +59,9 @@ before starting A live; do not tune the strategy to the replay.
   EXP-010_RESULTS.md.
 - Panels are sliced to a rolling ~560-day warmup per step for speed;
   every lookback the replayed portfolios use (liquidity 20d, vol 60d,
-  momentum 90d, forecast point-in-time) is far inside that window.
+  momentum 90d, forecast point-in-time) is far inside that window. The
+  one consumer that needed an absolute position — `due_tranches` —
+  is patched to the full calendar (Amendment 1).
 - Expected runtime: tens of minutes (per-day signal recomputation).
 
 ## How to run (local)
@@ -71,3 +74,27 @@ python experiments\exp011_replay_forward.py
 
 Paste back the final JSON. Delete `forward_replay/` to re-run; never
 commit it.
+
+## Amendment 1 (2026-10-29) — harness due-date fix, before re-run
+
+First run (2022-01-04 – 2026-09-25, ¥400,000): R +¥1,061,899 (1.145),
+W +¥1,013,383 (1.161), V +¥841,670 (1.101), S +¥1,081,117 (annual
+31.84%, max DD −21.77%, ratio 1.463), A +¥887,349 (27.99%, −23.84%,
+1.174). Check 1 passed clearly. Check 2 nominally failed (A 1.174 <
+S 1.463) — **but the run is invalid from 2023-07-19 onward** and the
+A-vs-S judgement is suspended until the re-run:
+
+- The pasted daily log shows `tranches_due` degrading from 2023-07-19:
+  the same tranche due for weeks at a time, long all-empty stretches —
+  not the intended every-2-days rotation.
+- Cause: `exp004_forward.due_tranches` counts trading days since START
+  *within the panel it is handed*. The harness hands a rolling 560-day
+  slice, so once the slice start passed START (START + 560d ≈
+  2023-07-18) the count froze at the ~constant number of trading days
+  inside the trailing window. The live `step` hands the full history,
+  so live forward is unaffected; only the replay harness was wrong.
+- Fix (harness only; live engine and strategy untouched): the harness
+  now replaces `due_tranches` with a count on the full price calendar,
+  which is identical to the stock function on a full-history panel.
+- The two checks above are unchanged. Do not tune the strategy to the
+  first run's numbers.
