@@ -139,7 +139,7 @@ def list_rows(day: pd.Timestamp) -> list[dict]:
                 continue
             found += 1
             title = re.search(r'kjTitle"[^>]*>.*?<a href="([^"]+\.pdf)"[^>]*>(.*?)</a>', tr, re.S)
-            xbrl = re.search(r'kjXbrl"[^>]*>.*?<a href="([^"]+\.zip)"', tr, re.S)
+            xbrl = re.search(r'kjXbrl"[^>]*>.*?<a [^>]*href="([^"]+\.zip)"', tr, re.S)
             tm = re.search(r'kjTime"[^>]*>\s*([0-9:]+)', tr)
             rows.append({"code": code.group(1)[:4], "time": (tm.group(1) + ":00") if tm else "",
                          "title": re.sub(r"<[^>]+>|\s+", "", title.group(2)) if title else "",
