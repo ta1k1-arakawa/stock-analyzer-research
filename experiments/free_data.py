@@ -259,6 +259,41 @@ def update_fundamentals(codes: list[str], days: int = 7) -> dict:
     return {"added": added, "failed": failed, **stats}
 
 
+def update_restate_events(codes: list[str], days: int = 10) -> dict:
+    """EXP-047: append numeric-correction events on earnings releases
+    (title contains both the numeric-data-correction marker and the
+    earnings-release marker) to forward/restate_events.csv."""
+    path = FWD / "restate_events.csv"
+    seen, rows = set(), []
+    if path.exists():
+        with path.open(newline="") as f:
+            for r in csv.DictReader(f):
+                rows.append(r)
+                seen.add((r["date"], r["code"], r["title"]))
+    universe = set(codes)
+    added = 0
+    today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+    for back in range(days):
+        day = today - pd.Timedelta(days=back)
+        for d in list_rows(day):
+            title = d["title"]
+            if d["code"] not in universe or "数値データ訂正" not in title \
+                    or "決算短信" not in title:
+                continue
+            key = (str(day.date()), d["code"], title)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"date": key[0], "code": key[1], "title": title})
+            added += 1
+    rows.sort(key=lambda r: (r["date"], r["code"]))
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["date", "code", "title"])
+        w.writeheader()
+        w.writerows(rows)
+    return {"added": added, "total": len(rows)}
+
+
 # ----------------------------------------------------------------------------
 # loader with the same shapes as exp003_rotation.load
 # ----------------------------------------------------------------------------
