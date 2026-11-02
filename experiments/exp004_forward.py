@@ -53,7 +53,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
@@ -66,8 +66,46 @@ def update_data() -> None:
     codes = (FWD / "universe.txt").read_text().split()
     print(json.dumps({"prices": FD.update_prices(codes), "fundamentals": FD.update_fundamentals(codes, days=10),
                       "restate_events": FD.update_restate_events(codes, days=10),
-                      "large_events": update_large_events(codes, days=10)},
+                      "large_events": update_large_events(codes, days=10),
+                      "voluntary_events": update_voluntary_events(codes, days=10)},
                      ensure_ascii=False))
+
+
+_VOLUNTARY_PATS = ("決算説明", "説明会", "個人投資家", "中期経営計画")
+
+
+def update_voluntary_events(codes: list[str], days: int = 10) -> dict:
+    """EXP-055: append voluntary-disclosure events (EXP-054 title
+    patterns) from the TDnet daily lists to
+    forward/voluntary_events.csv."""
+    path = FWD / "voluntary_events.csv"
+    seen, rows = set(), []
+    if path.exists():
+        ev = pd.read_csv(path, dtype={"code": str})
+        for _, r in ev.iterrows():
+            row = {"date": str(r["date"])[:10], "code": r["code"],
+                   "title": str(r.get("title", ""))}
+            rows.append(row)
+            seen.add((row["date"], row["code"], row["title"]))
+    universe = set(codes)
+    added = 0
+    today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+    for back in range(days):
+        day = today - pd.Timedelta(days=back)
+        for d in FD.list_rows(day):
+            if d["code"] not in universe:
+                continue
+            if not any(p in d["title"] for p in _VOLUNTARY_PATS):
+                continue
+            key = (str(day.date()), d["code"], d["title"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"date": key[0], "code": key[1], "title": key[2]})
+            added += 1
+    rows.sort(key=lambda r: (r["date"], r["code"]))
+    pd.DataFrame(rows, columns=["date", "code", "title"]).to_csv(path, index=False)
+    return {"added": added, "total": len(rows)}
 
 
 _IMPPROP_NONE = re.compile(r"(該当|記載)(事項)?(なし|無し|はありません|ございません)")
@@ -430,6 +468,22 @@ def activist_flags(today: pd.Timestamp) -> set[str]:
     return set(ev.loc[(age >= 1) & (age <= 120), "code"])
 
 
+def voluntary_bonus(today: pd.Timestamp) -> set[str]:
+    """EXP-054/055: codes whose voluntary-disclosure count rose by
+    >= 2 (last 365 days vs the 365 days before that)."""
+    path = FWD / "voluntary_events.csv"
+    if not path.exists():
+        return set()
+    ev = pd.read_csv(path, dtype={"code": str})
+    if ev.empty:
+        return set()
+    age = (today - pd.to_datetime(ev["date"])).dt.days
+    cur = ev.loc[(age >= 0) & (age < 365), "code"].value_counts()
+    pri = ev.loc[(age >= 365) & (age < 730), "code"].value_counts()
+    delta = cur.subtract(pri, fill_value=0)
+    return set(delta[delta >= 2].index)
+
+
 def rank_multiplier(rank: float) -> float:
     """EXP-007 W: 1-10th 1.5x, 20th 1.0x, 30th and below 0.5x."""
     return float(np.clip(2.0 - rank / 20.0, 0.5, 1.5))
@@ -476,6 +530,10 @@ def load_state() -> dict:
         if "AA" not in state:  # EXP-053: AA = A with the EXP-052 activist follow (long bonus + short exclusion)
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["AA"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                           "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AV" not in state:  # EXP-055: AV = A with the EXP-054 voluntary-disclosure bonus on the long side
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AV"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
@@ -583,6 +641,12 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         else:
             rank["AA"] = rank["A"]
         rank["AA_s"] = rank["A"][[x not in act for x in rank["A"].index]]
+        vd = voluntary_bonus(today)
+        if vd:
+            boosted_v = tilted + 0.10 * tilted.index.isin(vd)
+            rank["AV"] = boosted_v.dropna().sort_values(ascending=False, kind="stable")
+        else:
+            rank["AV"] = rank["A"]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -611,7 +675,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name == "AR" else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053: AR shorts follow A; AA shorts follow A minus activist-flagged names
+                    srank = rank["A"] if name in ("AR", "AV") else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053/055: AR/AV shorts follow A; AA shorts follow A minus activist-flagged names
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -640,7 +704,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
