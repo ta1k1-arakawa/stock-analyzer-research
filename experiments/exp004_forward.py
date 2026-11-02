@@ -53,7 +53,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
@@ -65,8 +65,69 @@ REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/vo
 def update_data() -> None:
     codes = (FWD / "universe.txt").read_text().split()
     print(json.dumps({"prices": FD.update_prices(codes), "fundamentals": FD.update_fundamentals(codes, days=10),
-                      "restate_events": FD.update_restate_events(codes, days=10)},
+                      "restate_events": FD.update_restate_events(codes, days=10),
+                      "large_events": update_large_events(codes, days=10)},
                      ensure_ascii=False))
+
+
+_IMPPROP_NONE = re.compile(r"(該当|記載)(事項)?(なし|無し|はありません|ございません)")
+
+
+def _impprop_present(h: dict) -> bool:
+    """EXP-052: ImpProp free text indicates important proposals."""
+    v = h.get("ImpProp")
+    return isinstance(v, str) and bool(v.strip()) and not _IMPPROP_NONE.search(v)
+
+
+def update_large_events(codes: list[str], days: int = 10) -> dict:
+    """EXP-053: append qualifying activist large-holding events
+    (EXP-052 rules) to forward/large_events.csv, fetched from
+    J-Quants by submission date. Never raises: a feed failure must
+    not stop the daily routine."""
+    path = FWD / "large_events.csv"
+    seen, rows = set(), []
+    if path.exists():
+        ev = pd.read_csv(path, dtype={"code": str})
+        for _, r in ev.iterrows():
+            rows.append({"date": str(r["date"])[:10], "code": r["code"]})
+            seen.add((str(r["date"])[:10], r["code"]))
+    universe = set(codes)
+    added = 0
+    try:
+        sys.path.insert(0, str(Path.home() / "workspace" / "custom-connectors" / "custom.jquants" / "bin"))
+        from jquants_api import get_json
+        today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+        for back in range(days):
+            day = today - pd.Timedelta(days=back)
+            data = get_json("/v2/edinet/large-volume-shareholders",
+                            {"date": day.strftime("%Y%m%d")})
+            for d in data.get("data", []):
+                raw = str(d.get("Code", ""))
+                code = raw[:4] if len(raw) == 5 and raw.endswith("0") else raw
+                if code not in universe:
+                    continue
+                t = str(d.get("LargeHldgTypeCode"))
+                if t not in ("1", "2"):
+                    continue
+                if not any(_impprop_present(h) for h in (d.get("Hldrs") or [])):
+                    continue
+                if t == "2":
+                    try:
+                        if float(d.get("TotalShsRatio")) - float(d.get("TotalShsRatioLast")) < 0.01:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                key = (str(d.get("SubDate"))[:10], code)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"date": key[0], "code": code})
+                added += 1
+    except Exception as e:  # feed failure: keep existing events
+        print(f"large_events update failed: {str(e)[:200]}")
+    rows.sort(key=lambda r: (r["date"], r["code"]))
+    pd.DataFrame(rows, columns=["date", "code"]).to_csv(path, index=False)
+    return {"added": added, "total": len(rows)}
 
 
 def next_trading_day(after: pd.Timestamp) -> pd.Timestamp:
@@ -355,6 +416,20 @@ def restate_flags(today: pd.Timestamp) -> set[str]:
     return set(counts[counts >= 2].index)
 
 
+def activist_flags(today: pd.Timestamp) -> set[str]:
+    """EXP-052/053: codes within 120 calendar days after a qualifying
+    activist large-holding event (active from the day after the
+    submission date)."""
+    path = FWD / "large_events.csv"
+    if not path.exists():
+        return set()
+    ev = pd.read_csv(path, dtype={"code": str})
+    if ev.empty:
+        return set()
+    age = (today - pd.to_datetime(ev["date"])).dt.days
+    return set(ev.loc[(age >= 1) & (age <= 120), "code"])
+
+
 def rank_multiplier(rank: float) -> float:
     """EXP-007 W: 1-10th 1.5x, 20th 1.0x, 30th and below 0.5x."""
     return float(np.clip(2.0 - rank / 20.0, 0.5, 1.5))
@@ -397,6 +472,10 @@ def load_state() -> dict:
         if "AR" not in state:  # EXP-047: AR = A with the EXP-046 restatement screen on the long side
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["AR"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                           "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AA" not in state:  # EXP-053: AA = A with the EXP-052 activist follow (long bonus + short exclusion)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AA"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
@@ -497,6 +576,13 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         rank["A"] = tilted.dropna().sort_values(ascending=False, kind="stable")
         flagged = restate_flags(today)
         rank["AR"] = rank["A"][[x not in flagged for x in rank["A"].index]]
+        act = activist_flags(today)
+        if act:
+            boosted = tilted + 0.15 * tilted.index.isin(act)
+            rank["AA"] = boosted.dropna().sort_values(ascending=False, kind="stable")
+        else:
+            rank["AA"] = rank["A"]
+        rank["AA_s"] = rank["A"][[x not in act for x in rank["A"].index]]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -525,7 +611,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name == "AR" else rank[name]  # EXP-047: AR shorts follow A
+                    srank = rank["A"] if name == "AR" else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053: AR shorts follow A; AA shorts follow A minus activist-flagged names
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -554,7 +640,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
