@@ -42,7 +42,11 @@ def universe() -> set[str]:
 
 def fetch_json(url: str, tries: int = 3) -> dict | None:
     for k in range(tries):
-        status, _, body = EA.fetch(url)
+        try:
+            status, _, body = EA.fetch(url)
+        except Exception:
+            time.sleep(5 * (k + 1))
+            continue
         if status == 200:
             return json.loads(body.decode("utf-8"))
         if status == 429 or status >= 500:
@@ -54,7 +58,11 @@ def fetch_json(url: str, tries: int = 3) -> dict | None:
 
 def fetch_bytes(url: str, tries: int = 3) -> bytes | None:
     for k in range(tries):
-        status, _, body = EA.fetch(url)
+        try:
+            status, _, body = EA.fetch(url)
+        except Exception:
+            time.sleep(5 * (k + 1))
+            continue
         if status == 200:
             return body
         if status == 429 or status >= 500:
@@ -73,7 +81,9 @@ _FW = str.maketrans("０１２３４５６７８９（）％", "0123456789()%")
 
 
 def normalize(s: str) -> str:
-    return re.sub(r"\s+", "", s.translate(_FW))
+    s = s.translate(_FW)
+    s = re.sub(r"[－―—]", "", s)  # dash used for nil abstentions
+    return re.sub(r"\s+", "", s)
 
 
 def split_rest(rest: str, votes_for: int, appr: float) -> tuple[int, int] | None:
@@ -104,9 +114,11 @@ def candidate_names(t: str) -> set[str]:
     names: set[str] = set()
     for m in re.finditer(r"として、?(.{2,200}?)を選任", t):
         for nm in re.split(r"[、及びおよび]+", m.group(1)):
-            nm = nm.strip("　 ")
+            nm = re.sub(r"の\d+名$", "", nm.strip("　 "))
             if 2 <= len(nm) <= 6 and re.fullmatch(r"[一-龥ぁ-んァ-ヶ・]+", nm):
                 names.add(nm)
+    for m in re.finditer(r"([一-龥ぁ-んァ-ヶ・]{2,6})を(?:取締役|監査役)[^、]{0,6}選任", t):
+        names.add(m.group(1))
     return names
 
 
@@ -181,12 +193,95 @@ def extract(zip_bytes: bytes) -> dict | None:
                 (p["approval_pct"] for p in shp), default=None)}
 
 
+FIELDS = ["code", "filer", "submit", "agm_date", "doc_id", "n_candidates",
+          "min_approval_pct", "rep_approval_pct", "shareholder_proposal",
+          "shareholder_max_approval", "all_approval_pcts"]
+
+
+def append_rows(rows: list[dict]) -> None:
+    if not rows:
+        return
+    exists = OUT.exists()
+    with OUT.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        if not exists:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def build_row(r: dict, ds: str, ext: dict | None) -> dict:
+    code = (r.get("secCode") or "")[:4]
+    base = {"code": code, "filer": r.get("filerName", ""), "submit": ds,
+            "agm_date": "", "doc_id": r["docID"], "n_candidates": 0,
+            "min_approval_pct": "", "rep_approval_pct": "",
+            "shareholder_proposal": "", "shareholder_max_approval": "",
+            "all_approval_pcts": ""}
+    if ext and ext["rows"]:
+        apprs = [x["approval_pct"] for x in ext["rows"]]
+        rep_appr = next((x["approval_pct"] for x in ext["rows"]
+                         if x.get("is_rep")), None)
+        base.update({
+            "agm_date": ext["agm_date"], "n_candidates": len(ext["rows"]),
+            "min_approval_pct": min(apprs),
+            "rep_approval_pct": rep_appr if rep_appr is not None else "",
+            "shareholder_proposal": int(ext["has_shareholder_proposal"]),
+            "shareholder_max_approval": (
+                ext["shareholder_max_approval"]
+                if ext["shareholder_max_approval"] is not None else ""),
+            "all_approval_pcts": ";".join(str(a) for a in apprs)})
+    return base
+
+
+def recover() -> None:
+    """Rebuild CSV rows for filings whose zips were archived by a run
+    that died before its end-of-run CSV write. List metadata is
+    re-fetched (lists only, no document downloads)."""
+    state = json.loads(STATE.read_text())
+    done = sorted(state["done_dates"])
+    seen = set(state["docids"])
+    have = set()
+    if OUT.exists():
+        with OUT.open(newline="") as f:
+            have = {row["doc_id"] for row in csv.DictReader(f)}
+    uni = universe()
+    total = 0
+    for ds in done:
+        d = fetch_json(f"{HOST}/documents.json?date={ds}&type=2")
+        if d is None:
+            print(f"{ds}: list fetch failed in recover", flush=True)
+            continue
+        rows = []
+        for r in d.get("results", []):
+            doc = r.get("docID")
+            if (r.get("docTypeCode") != "180" or r.get("secCode") not in uni
+                    or doc not in seen or doc in have):
+                continue
+            zp = ZIPS / f"{doc}.zip"
+            ext = None
+            if zp.exists():
+                try:
+                    ext = extract(zp.read_bytes())
+                except Exception as e:
+                    print(f"{ds} {doc}: extract error {e}", flush=True)
+            rows.append(build_row(r, ds, ext))
+            have.add(doc)
+        append_rows(rows)
+        total += len(rows)
+        print(f"{ds}: recovered {len(rows)}", flush=True)
+    print(f"recover finished: {total} rows")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="dfrom")
     ap.add_argument("--to", dest="dto")
     ap.add_argument("--recent", type=int)
+    ap.add_argument("--recover", action="store_true")
     args = ap.parse_args()
+    if args.recover:
+        BASE.mkdir(parents=True, exist_ok=True)
+        recover()
+        return
     import pandas as pd
     today = pd.Timestamp.now(tz="Asia/Tokyo").normalize().tz_localize(None)
     if args.recent:
@@ -200,8 +295,12 @@ def main() -> None:
              else {"done_dates": [], "docids": []})
     done = set(state["done_dates"])
     seen_docs = set(state["docids"])
+    in_csv = set()
+    if OUT.exists():
+        with OUT.open(newline="") as f:
+            in_csv = {row["doc_id"] for row in csv.DictReader(f)}
     uni = universe()
-    new_rows = []
+    total = 0
     day = dfrom
     while day <= dto:
         ds = str(day.date())
@@ -217,6 +316,7 @@ def main() -> None:
                    if r.get("docTypeCode") == "180"
                    and r.get("secCode") in uni
                    and r.get("docID") not in seen_docs]
+        day_rows = []
         for r in targets:
             doc = r["docID"]
             body = fetch_bytes(f"{HOST}/documents/{doc}?type=5")
@@ -230,44 +330,18 @@ def main() -> None:
             except Exception as e:  # keep the zip; parsing can be redone
                 print(f"{ds} {doc}: extract error {e}", flush=True)
                 ext = None
-            code = (r.get("secCode") or "")[:4]
-            if ext and ext["rows"]:
-                apprs = [x["approval_pct"] for x in ext["rows"]]
-                rep_appr = next((x["approval_pct"] for x in ext["rows"]
-                                 if x.get("is_rep")), None)
-                new_rows.append({
-                    "code": code, "filer": r.get("filerName", ""),
-                    "submit": ds, "agm_date": ext["agm_date"], "doc_id": doc,
-                    "n_candidates": len(ext["rows"]),
-                    "min_approval_pct": min(apprs),
-                    "rep_approval_pct": rep_appr if rep_appr is not None else "",
-                    "shareholder_proposal": int(ext["has_shareholder_proposal"]),
-                    "shareholder_max_approval": (
-                        ext["shareholder_max_approval"]
-                        if ext["shareholder_max_approval"] is not None else ""),
-                    "all_approval_pcts": ";".join(str(a) for a in apprs)})
-            else:
-                new_rows.append({
-                    "code": code, "filer": r.get("filerName", ""),
-                    "submit": ds, "agm_date": "", "doc_id": doc,
-                    "n_candidates": 0, "min_approval_pct": "",
-                    "rep_approval_pct": "", "shareholder_proposal": "",
-                    "shareholder_max_approval": "",
-                    "all_approval_pcts": ""})
+            if doc not in in_csv:
+                day_rows.append(build_row(r, ds, ext))
+                in_csv.add(doc)
             time.sleep(1.2)
+        append_rows(day_rows)  # write BEFORE marking the date done
+        total += len(day_rows)
         done.add(ds)
         state = {"done_dates": sorted(done), "docids": sorted(seen_docs)}
         STATE.write_text(json.dumps(state))
         print(f"{ds}: done (targets {len(targets)})", flush=True)
         day += pd.Timedelta(days=1)
-    if new_rows:
-        exists = OUT.exists()
-        with OUT.open("a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(new_rows[0].keys()))
-            if not exists:
-                w.writeheader()
-            w.writerows(new_rows)
-    print(f"finished: {len(new_rows)} filings recorded")
+    print(f"finished: {total} filings recorded")
 
 
 if __name__ == "__main__":
