@@ -27,7 +27,7 @@ FWD = ROOT / "forward"
 PRICES = ROOT / "data" / "free" / "prices"
 FUND = FWD / "fundamentals.csv"
 FUND_FIELDS = ["code", "disc_date", "disc_time", "disc_no", "doc_type", "per_type", "fy_end",
-               "equity", "np_forecast", "shares_out"]
+               "equity", "np_forecast", "shares_out", "np_actual", "sales"]
 TDNET = "https://www.release.tdnet.info/inbs/"
 TOPIX_PROXY = "1306"
 UA = {"User-Agent": "Mozilla/5.0 (stock-analyzer research)"}
@@ -110,6 +110,8 @@ def pick(vals, names: tuple[str, ...], ctx_all: tuple[str, ...], ctx_none: tuple
 
 
 NP_FORECAST = ("ForecastProfitAttributableToOwnersOfParent", "ForecastNetIncome", "ForecastProfit")
+NP_ACTUAL = ("ProfitAttributableToOwnersOfParent", "NetIncome", "Profit")
+SALES = ("NetSales", "OperatingRevenue", "Revenue", "GrossOperatingRevenue")
 EQUITY = ("NetAssets",)
 SHARES = ("NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",)
 
@@ -121,6 +123,10 @@ def parse_summary(html: str, is_fy_statement: bool, is_statement: bool) -> dict:
     if is_statement:
         out["equity"] = pick(vals, EQUITY, ("Instant", "ResultMember"), ("Prior",))
         out["shares_out"] = pick(vals, SHARES, ("Instant",), ("Prior",))  # issued, incl. treasury (as J-Quants)
+        # EXP-081: actuals for the forecast-credibility episodes (NP of FY
+        # statements feeds the bias history; sales feeds the LA test)
+        out["np_actual"] = pick(vals, NP_ACTUAL, ("CurrentYearDuration", "ResultMember"), ("Prior",))
+        out["sales"] = pick(vals, SALES, ("CurrentYearDuration", "ResultMember"), ("Prior",))
     return out
 
 
@@ -240,6 +246,8 @@ def update_fundamentals(codes: list[str], days: int = 7) -> dict:
                    "equity": "" if vals.get("equity") is None else str(int(vals["equity"])),
                    "np_forecast": "" if vals.get("np_forecast") is None else str(int(vals["np_forecast"])),
                    "shares_out": "" if vals.get("shares_out") is None else str(int(vals["shares_out"])),
+                   "np_actual": "" if vals.get("np_actual") is None else str(int(vals["np_actual"])),
+                   "sales": "" if vals.get("sales") is None else str(int(vals["sales"])),
                    "pdf": d["pdf"]}
             rows.append({k: rec[k] for k in FUND_FIELDS})
             seen.add((d["code"], disc_no))
@@ -307,6 +315,7 @@ def load():
             "DiscDate": r.disc_date, "DiscTime": r.disc_time, "DocType": r.doc_type, "CurPerType": r.per_type,
             "CurFYEn": r.fy_end, "Eq": r.equity, "FNP": "" if is_fy else r.np_forecast,
             "NxFNp": r.np_forecast if is_fy else "", "NxtFYEn": "",
+            "NP": getattr(r, "np_actual", ""), "Sales": getattr(r, "sales", ""),
         })
     px = {}
     for f in sorted(PRICES.glob("*.csv")):

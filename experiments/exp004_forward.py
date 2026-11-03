@@ -53,7 +53,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 SHORT_FRAC_BY = {"A75": 0.75}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only)
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
@@ -466,6 +466,60 @@ def transitional_flags() -> set[str]:
     return set(df["code"]) if not df.empty else set()
 
 
+def fc_episodes_today(fins: dict, today: pd.Timestamp) -> tuple[dict, set]:
+    """EXP-080/081: forecast-credibility episodes active on `today`.
+    Returns ({code: 1 + clipped habit}, {loss-avoidance codes}).
+    Mirrors experiments/exp080_forecast_credibility.py exactly:
+    an episode runs from the FY results disclosure that sets NxFNp
+    until the first later disclosure that changes the forecast, or
+    3 months, whichever first; habit = mean initial-forecast bias of
+    the last 3 completed fiscal years (needs >= 2)."""
+    def num(x):
+        try:
+            return float(x)
+        except Exception:
+            return float("nan")
+    import numpy as _np
+    factors, la_codes = {}, set()
+    for code, recs in fins.items():
+        rows = []
+        for r in recs:
+            if not r.get("DiscDate"):
+                continue
+            is_fy = r.get("CurPerType") == "FY" and "FinancialStatements" in str(r.get("DocType"))
+            fv = num(r.get("NxFNp")) if is_fy else num(r.get("FNP"))
+            rows.append({"d": pd.Timestamp(r["DiscDate"]), "t": str(r.get("DiscTime") or ""),
+                         "is_fy": is_fy, "fv": fv, "np": num(r.get("NP")),
+                         "sales": num(r.get("Sales")), "nx": num(r.get("NxFNp"))})
+        rows.sort(key=lambda x: (x["d"], x["t"]))
+        biases, pending_init = [], _np.nan
+        for i, r in enumerate(rows):
+            if not r["is_fy"]:
+                continue
+            if _np.isfinite(pending_init) and _np.isfinite(r["np"]) and r["np"] != 0:
+                biases.append(float(_np.clip((pending_init - r["np"]) / abs(r["np"]), -2, 2)))
+            pending_init = r["nx"]
+            v0 = r["nx"]
+            if not _np.isfinite(v0) or len(biases) < 2 or r["d"] > today:
+                continue
+            cap = r["d"] + pd.DateOffset(months=3)
+            end = cap
+            for r2 in rows[i + 1:]:
+                if r2["d"] > cap:
+                    break
+                if _np.isfinite(r2["fv"]) and r2["fv"] != v0:
+                    end = r2["d"]
+                    break
+            if r["d"] <= today < end:
+                habit = float(_np.mean(biases[-3:]))
+                factors[code] = 1.0 + float(_np.clip(habit, -0.5, 1.0))
+                if (_np.isfinite(r["np"]) and r["np"] < 0 and 0 < v0
+                        and _np.isfinite(r["sales"]) and r["sales"] > 0
+                        and v0 < 0.01 * r["sales"]):
+                    la_codes.add(code)
+    return factors, la_codes
+
+
 def activist_flags(today: pd.Timestamp) -> set[str]:
     """EXP-052/053: codes within 120 calendar days after a qualifying
     activist large-holding event (active from the day after the
@@ -554,6 +608,10 @@ def load_state() -> dict:
         if "AT" not in state:  # EXP-077: AT = A with TOPIX transitional stocks excluded on the long side
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["AT"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                           "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AF" not in state:  # EXP-081: AF = A with the EXP-080 forecast-credibility haircut
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AF"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
@@ -670,6 +728,23 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             rank["AV"] = boosted_v.dropna().sort_values(ascending=False, kind="stable")
         else:
             rank["AV"] = rank["A"]
+        fc_factors, fc_la = fc_episodes_today(fins, today)
+        if fc_factors:
+            eq_f, npf_f = E3.fundamentals(fins, dates)
+            eq_t = eq_f.loc[today].reindex(comp.index)
+            npf_t = npf_f.loc[today].reindex(comp.index)
+            fac = pd.Series({x: fc_factors.get(x, 1.0) for x in comp.index})
+            npf_adj = npf_t / fac
+            mcap_t = panel["MktCap"].loc[today].reindex(comp.index) * 1e6
+            liq_t = panel["Va"].fillna(0.0).rolling(E3.LIQ_DAYS, min_periods=E3.LIQ_DAYS).mean().loc[today].reindex(comp.index)
+            ok_t = (liq_t >= E3.LIQ_MIN) & (mcap_t > 0) & (eq_t > 0) & npf_adj.notna() & panel["C"].loc[today].reindex(comp.index).notna()
+            comp_fc = (eq_t / mcap_t).where(ok_t).rank(pct=True) + (npf_adj / eq_t).where(ok_t).rank(pct=True)
+            tilted_fc = (comp_fc.rank(pct=True) + mom_today.reindex(comp_fc.index)) / 2.0
+            rank["AF_s"] = tilted_fc.dropna().sort_values(ascending=False, kind="stable")
+            rank["AF"] = rank["AF_s"][[x not in fc_la for x in rank["AF_s"].index]]
+        else:
+            rank["AF"] = rank["A"]
+            rank["AF_s"] = rank["A"]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -698,7 +773,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT") else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053/055/077: AR/AV/A75/AT shorts follow A; AA shorts follow A minus activist-flagged names
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name == "AF" else rank[name]))  # EXP-047/053/055/077: AR/AV/A75/AT shorts follow A; AA shorts follow A minus activist-flagged names; AF shorts follow A_fc (EXP-081)
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -727,7 +802,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
