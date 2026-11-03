@@ -53,9 +53,9 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
-SHORT_FRAC_BY = {"A75": 0.75}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only)
+SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
 
@@ -613,6 +613,14 @@ def load_state() -> dict:
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["AF"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "A75F" not in state:  # EXP-082: A75F = AF score with short fraction 0.75
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["A75F"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AV75" not in state:  # EXP-082: AV75 = AV score with short fraction 0.75
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AV75"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["V"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
@@ -745,6 +753,9 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         else:
             rank["AF"] = rank["A"]
             rank["AF_s"] = rank["A"]
+        rank["A75F"] = rank["AF"]  # EXP-082: identical scores to AF; only the short fraction differs
+        rank["A75F_s"] = rank["AF_s"]
+        rank["AV75"] = rank["AV"]  # EXP-082: identical score to AV; only the short fraction differs
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -773,7 +784,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name == "AF" else rank[name]))  # EXP-047/053/055/077: AR/AV/A75/AT shorts follow A; AA shorts follow A minus activist-flagged names; AF shorts follow A_fc (EXP-081)
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name == "AF" else (rank["A75F_s"] if name == "A75F" else rank[name])))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75 shorts follow A; AA shorts follow A minus activist-flagged names; AF/A75F shorts follow A_fc (EXP-081/082)
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -802,7 +813,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
