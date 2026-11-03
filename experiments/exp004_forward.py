@@ -53,7 +53,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 SHORT_FRAC_BY = {"A75": 0.75}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only)
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
@@ -455,6 +455,17 @@ def restate_flags(today: pd.Timestamp) -> set[str]:
     return set(counts[counts >= 2].index)
 
 
+def transitional_flags() -> set[str]:
+    """EXP-077: TOPIX second-stage transitional stocks (JPX list of
+    2026-10-07), static seed file; the step-down schedule runs to the
+    2027-10 re-evaluation. Missing file -> no exclusions."""
+    path = FWD / "transitional_codes.csv"
+    if not path.exists():
+        return set()
+    df = pd.read_csv(path, dtype={"code": str})
+    return set(df["code"]) if not df.empty else set()
+
+
 def activist_flags(today: pd.Timestamp) -> set[str]:
     """EXP-052/053: codes within 120 calendar days after a qualifying
     activist large-holding event (active from the day after the
@@ -539,6 +550,10 @@ def load_state() -> dict:
         if "A75" not in state:  # EXP-074: A75 = A mechanics with short fraction 0.75 (starts with R's first long orders)
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["A75"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                           "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AT" not in state:  # EXP-077: AT = A with TOPIX transitional stocks excluded on the long side
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AT"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
@@ -647,6 +662,8 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             rank["AA"] = rank["A"]
         rank["AA_s"] = rank["A"][[x not in act for x in rank["A"].index]]
         rank["A75"] = rank["A"]  # EXP-074: identical score to A; only the short fraction differs
+        tflag = transitional_flags()
+        rank["AT"] = rank["A"][[x not in tflag for x in rank["A"].index]]  # EXP-077: long-side exclusion of transitional stocks
         vd = voluntary_bonus(today)
         if vd:
             boosted_v = tilted + 0.10 * tilted.index.isin(vd)
@@ -681,7 +698,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75") else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053/055: AR/AV shorts follow A; AA shorts follow A minus activist-flagged names
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT") else (rank["AA_s"] if name == "AA" else rank[name])  # EXP-047/053/055/077: AR/AV/A75/AT shorts follow A; AA shorts follow A minus activist-flagged names
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -710,7 +727,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
