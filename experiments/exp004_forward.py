@@ -53,9 +53,9 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75", "AF15", "A625", "AB", "AF125", "AF15625", "AVF15")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
-SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75, "AV75F": 0.75, "ATOW75": 0.75}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV; EXP-086: AV75F/ATOW75 likewise
+SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75, "AV75F": 0.75, "ATOW75": 0.75, "A625": 0.625, "AF15625": 0.625}  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV; EXP-086: AV75F/ATOW75 likewise; EXP-089: A625 is the middle dose
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
 
@@ -68,6 +68,7 @@ def update_data() -> None:
     print(json.dumps({"prices": FD.update_prices(codes), "fundamentals": FD.update_fundamentals(codes, days=10),
                       "restate_events": FD.update_restate_events(codes, days=10),
                       "large_events": update_large_events(codes, days=10),
+                      "broad_events": update_broad_events(codes, days=10),
                       "voluntary_events": update_voluntary_events(codes, days=10)},
                      ensure_ascii=False))
 
@@ -520,6 +521,68 @@ def fc_episodes_today(fins: dict, today: pd.Timestamp) -> tuple[dict, set]:
     return factors, la_codes
 
 
+def update_broad_events(codes: list[str], days: int = 10) -> dict:
+    """EXP-089: append broad large-holding increase events (EXP-088
+    rules: type 1, or type 2 with >= 1pt ratio increase, any filer)
+    to forward/broad_events.csv. Never raises."""
+    path = FWD / "broad_events.csv"
+    seen, rows = set(), []
+    if path.exists():
+        ev = pd.read_csv(path, dtype={"code": str})
+        for _, r in ev.iterrows():
+            rows.append({"date": str(r["date"])[:10], "code": r["code"]})
+            seen.add((str(r["date"])[:10], r["code"]))
+    universe = set(codes)
+    added = 0
+    try:
+        sys.path.insert(0, str(Path.home() / "workspace" / "custom-connectors" / "custom.jquants" / "bin"))
+        from jquants_api import get_json
+        today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+        for back in range(days):
+            day = today - pd.Timedelta(days=back)
+            data = get_json("/v2/edinet/large-volume-shareholders",
+                            {"date": day.strftime("%Y%m%d")})
+            for d in data.get("data", []):
+                raw = str(d.get("Code", ""))
+                code = raw[:4] if len(raw) == 5 and raw.endswith("0") else raw
+                if code not in universe:
+                    continue
+                t = str(d.get("LargeHldgTypeCode"))
+                if t not in ("1", "2"):
+                    continue
+                if t == "2":
+                    try:
+                        if float(d.get("TotalShsRatio")) - float(d.get("TotalShsRatioLast")) < 0.01:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                key = (str(d.get("SubDate"))[:10], code)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"date": key[0], "code": code})
+                added += 1
+    except Exception as e:  # feed failure: keep existing events
+        print(f"broad_events update failed: {str(e)[:200]}")
+    rows.sort(key=lambda r: (r["date"], r["code"]))
+    pd.DataFrame(rows, columns=["date", "code"]).to_csv(path, index=False)
+    return {"added": added, "total": len(rows)}
+
+
+def broad_flags(today: pd.Timestamp) -> set[str]:
+    """EXP-088/089: codes within 120 calendar days after a broad
+    large-holding increase event (active from the day after the
+    submission date)."""
+    path = FWD / "broad_events.csv"
+    if not path.exists():
+        return set()
+    ev = pd.read_csv(path, dtype={"code": str})
+    if ev.empty:
+        return set()
+    age = (today - pd.to_datetime(ev["date"])).dt.days
+    return set(ev.loc[(age >= 1) & (age <= 120), "code"])
+
+
 def activist_flags(today: pd.Timestamp) -> set[str]:
     """EXP-052/053: codes within 120 calendar days after a qualifying
     activist large-holding event (active from the day after the
@@ -633,6 +696,30 @@ def load_state() -> dict:
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["ATOW75"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                                "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AF15" not in state:  # EXP-089: AF15 = AF with the habit haircut at 1.5x strength (EXP-087B)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AF15"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "A625" not in state:  # EXP-089: A625 = A with short fraction 0.625 (EXP-087C)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["A625"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AB" not in state:  # EXP-089: AB = A with the broad large-holding follow bonus (EXP-088)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AB"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                           "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AF125" not in state:  # EXP-091: AF125 = forecast-habit haircut x1.25 (EXP-090C)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AF125"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                              "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AF15625" not in state:  # EXP-091: AF15625 = AF x1.5 with short fraction 0.625 (EXP-090A)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AF15625"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                                "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AVF15" not in state:  # EXP-091: AVF15 = AV bonus on AF x1.5 (EXP-090B)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AVF15"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                              "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["V"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
@@ -768,6 +855,24 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             rank["AVF"] = avf_long[[x not in fc_la for x in avf_long.index]]
             rank["AV75F"] = rank["AVF"]
             rank["AV75F_s"] = rank["AF_s"]
+            fac15 = 1.0 + 1.5 * (fac - 1.0)
+            npf15 = npf_t / fac15
+            comp_fc15 = (eq_t / mcap_t).where(ok_t).rank(pct=True) + (npf15 / eq_t).where(ok_t).rank(pct=True)
+            tilted_fc15 = (comp_fc15.rank(pct=True) + mom_today.reindex(comp_fc15.index)) / 2.0
+            rank["AF15_s"] = tilted_fc15.dropna().sort_values(ascending=False, kind="stable")
+            rank["AF15"] = rank["AF15_s"][[x not in fc_la for x in rank["AF15_s"].index]]
+            fac125 = 1.0 + 1.25 * (fac - 1.0)
+            npf125 = npf_t / fac125
+            comp_fc125 = (eq_t / mcap_t).where(ok_t).rank(pct=True) + (npf125 / eq_t).where(ok_t).rank(pct=True)
+            tilted_fc125 = (comp_fc125.rank(pct=True) + mom_today.reindex(comp_fc125.index)) / 2.0
+            rank["AF125_s"] = tilted_fc125.dropna().sort_values(ascending=False, kind="stable")
+            rank["AF125"] = rank["AF125_s"][[x not in fc_la for x in rank["AF125_s"].index]]
+            rank["AF15625"] = rank["AF15"]
+            rank["AF15625_s"] = rank["AF15_s"]
+            boosted_fc15 = tilted_fc15 + 0.10 * tilted_fc15.index.isin(vd) if vd else tilted_fc15
+            rank["AVF15_s"] = rank["AF15_s"]
+            avf15_long = boosted_fc15.dropna().sort_values(ascending=False, kind="stable")
+            rank["AVF15"] = avf15_long[[x not in fc_la for x in avf15_long.index]]
         else:
             rank["AF"] = rank["A"]
             rank["AF_s"] = rank["A"]
@@ -775,6 +880,14 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             rank["AVF_s"] = rank["A"]
             rank["AV75F"] = rank["AV"]
             rank["AV75F_s"] = rank["A"]
+            rank["AF15"] = rank["A"]
+            rank["AF15_s"] = rank["A"]
+            rank["AF125"] = rank["A"]
+            rank["AF125_s"] = rank["A"]
+            rank["AF15625"] = rank["A"]
+            rank["AF15625_s"] = rank["A"]
+            rank["AVF15"] = rank["AV"]
+            rank["AVF15_s"] = rank["A"]
         rank["A75F"] = rank["AF"]  # EXP-082: identical scores to AF; only the short fraction differs
         rank["A75F_s"] = rank["AF_s"]
         rank["AV75"] = rank["AV"]  # EXP-082: identical score to AV; only the short fraction differs
@@ -785,6 +898,13 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         tow_r = tug.loc[today].reindex(comp.index).rank(pct=True).fillna(0.5)
         tow_score = ((comp.rank(pct=True) + mom_today.reindex(comp.index) + tow_r) / 3.0)
         rank["ATOW75"] = tow_score.dropna().sort_values(ascending=False, kind="stable")  # EXP-086: observation only
+        rank["A625"] = rank["A"]  # EXP-089: identical score to A; only the short fraction differs
+        bflag = broad_flags(today)
+        if bflag:
+            boosted_b = tilted + 0.10 * tilted.index.isin(bflag)
+            rank["AB"] = boosted_b.dropna().sort_values(ascending=False, kind="stable")
+        else:
+            rank["AB"] = rank["A"]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -813,7 +933,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else rank[name])))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75 shorts follow A; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc (EXP-081/082/086)
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75", "A625", "AB") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else (rank["AF15_s"] if name in ("AF15", "AF15625", "AVF15") else (rank["AF125_s"] if name == "AF125" else rank[name])))))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75/A625/AB shorts follow A; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc; AF15 shorts follow A_fc15 (EXP-081/082/086/089)
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -842,7 +962,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）", "AF15": "AF15（ペーパー：A＋予想の癖による割引×1.5）", "A625": "A625（ペーパー：A＋ショート比率0.625）", "AB": "AB（ペーパー：A＋大量保有の買い増し追随）", "AF125": "AF125（ペーパー：A＋予想の癖による割引×1.25）", "AF15625": "AF15625（ペーパー：AF×1.5＋ショート比率0.625）", "AVF15": "AVF15（ペーパー：AVボーナス＋予想の癖×1.5）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
