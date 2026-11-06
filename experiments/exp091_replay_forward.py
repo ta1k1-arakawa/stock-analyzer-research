@@ -106,17 +106,11 @@ def main(scratch: Path) -> None:
     for name in REPLAY_PORTFOLIOS:
         s = led[led.portfolio == name].set_index("date")["value"]
         out[name] = stats(s)
-    ratio = out["AV"]["profit"] / out["A"]["profit"]
-    checks = {
-        "1_A_within_5pct_of_scaled_backtest":
-            abs(out["A"]["profit"] - A_SCALED) <= 0.05 * A_SCALED,
-        "2_AV_above_A_and_ratio_within_10pct":
-            out["AV"]["profit"] > out["A"]["profit"]
-            and abs(ratio - RATIO_BT) <= 0.10 * RATIO_BT,
-    }
-    print(json.dumps({"replay": out, "AV_over_A_ratio": round(ratio, 4),
-                      "backtest_ratio": round(RATIO_BT, 4),
-                      "checks": checks},
+    # Final summary only (the ledger is already complete at this point;
+    # the registered conditions are evaluated by exp091_replay_check.py).
+    print(json.dumps({"replay": out,
+                      "A_within_5pct_of_scaled_backtest":
+                          abs(out["A"]["profit"] - A_SCALED) <= 0.05 * A_SCALED},
                      ensure_ascii=False, indent=1))
 
 
