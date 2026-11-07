@@ -53,9 +53,9 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75", "AF15", "A625", "AB", "ABG", "AF125", "AF15625", "AVF15", "AVG", "AVF625", "AV625", "ABD")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75", "AF15", "A625", "AB", "ABG", "AF125", "AF15625", "AVF15", "AVG", "AVF625", "AV625", "ABD", "ABD625", "ABDG", "ASH")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
-SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75, "AV75F": 0.75, "ATOW75": 0.75, "A625": 0.625, "AF15625": 0.625, "AVF625": 0.625, "AV625": 0.625}  # EXP-101: AVF625 (EXP-100A) and AV625 (EXP-100C) run the AVF15 / AV scores with the 0.625 short lever  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV; EXP-086: AV75F/ATOW75 likewise; EXP-089: A625 is the middle dose
+SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75, "AV75F": 0.75, "ATOW75": 0.75, "A625": 0.625, "AF15625": 0.625, "AVF625": 0.625, "AV625": 0.625, "ABD625": 0.625}  # EXP-103: ABD625 (EXP-102A) runs the ABD score with the 0.625 short lever  # EXP-101: AVF625 (EXP-100A) and AV625 (EXP-100C) run the AVF15 / AV scores with the 0.625 short lever  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV; EXP-086: AV75F/ATOW75 likewise; EXP-089: A625 is the middle dose
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
 
 
@@ -625,7 +625,8 @@ def update_decrease_events(codes: list[str], days: int = 10) -> dict:
     if path.exists():
         ev = pd.read_csv(path, dtype={"code": str})
         for _, r in ev.iterrows():
-            rows.append({"date": str(r["date"])[:10], "code": r["code"]})
+            rows.append({"date": str(r["date"])[:10], "code": r["code"],
+                         "strong": int(r["strong"]) if "strong" in ev.columns and pd.notna(r.get("strong")) else 0})
             seen.add((str(r["date"])[:10], r["code"]))
     universe = set(codes)
     added = 0
@@ -654,12 +655,13 @@ def update_decrease_events(codes: list[str], days: int = 10) -> dict:
                 if key in seen:
                     continue
                 seen.add(key)
-                rows.append({"date": key[0], "code": code})
+                rows.append({"date": key[0], "code": code,
+                             "strong": 1 if dec >= 0.03 else 0})  # EXP-103: graded tier (EXP-102C)
                 added += 1
     except Exception as e:  # feed failure: keep existing events
         print(f"decrease_events update failed: {str(e)[:200]}")
     rows.sort(key=lambda r: (r["date"], r["code"]))
-    pd.DataFrame(rows, columns=["date", "code"]).to_csv(path, index=False)
+    pd.DataFrame(rows, columns=["date", "code", "strong"]).to_csv(path, index=False)
     return {"added": added, "total": len(rows)}
 
 
@@ -674,6 +676,27 @@ def decrease_flags(today: pd.Timestamp) -> set[str]:
         return set()
     age = (today - pd.to_datetime(ev["date"])).dt.days
     return set(ev.loc[(age >= 1) & (age <= 120), "code"])
+
+
+def decrease_bonus(today: pd.Timestamp) -> dict:
+    """EXP-103: graded decrease penalty per code (EXP-102C). Codes
+    within 120 calendar days after a decrease event get -0.20 if any
+    covering event is strong (decrease >= 3pt), else -0.10; strong
+    wins on overlap, matching the book test. Rows without a strength
+    marker are weak. Returned as positive penalty magnitudes."""
+    path = FWD / "decrease_events.csv"
+    if not path.exists():
+        return {}
+    ev = pd.read_csv(path, dtype={"code": str})
+    if ev.empty:
+        return {}
+    age = (today - pd.to_datetime(ev["date"])).dt.days
+    act = ev.loc[(age >= 1) & (age <= 120)]
+    if act.empty:
+        return {}
+    strong = (act.assign(s=act["strong"] if "strong" in act.columns else 0)
+              .groupby("code")["s"].max())
+    return {code: (0.20 if s else 0.10) for code, s in strong.items()}
 
 
 def activist_flags(today: pd.Timestamp) -> set[str]:
@@ -848,6 +871,18 @@ def load_state() -> dict:
         if "ABD" not in state:  # EXP-101: ABD = A with the large-holding decrease penalty (EXP-100D)
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["ABD"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "ABD625" not in state:  # EXP-103: ABD625 = ABD score with short fraction 0.625 (EXP-102A)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["ABD625"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                               "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "ABDG" not in state:  # EXP-103: ABDG = A with the graded decrease penalty (EXP-102C)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["ABDG"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "ASH" not in state:  # EXP-103: ASH = A longs, habit-blended short ranking (EXP-102D)
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["ASH"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                             "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
@@ -1058,6 +1093,26 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
             rank["ABD"] = penalized.dropna().sort_values(ascending=False, kind="stable")
         else:
             rank["ABD"] = rank["A"]
+        rank["ABD625"] = rank["ABD"]  # EXP-103: identical score to ABD; only the short fraction differs
+        dbonus = decrease_bonus(today)
+        if dbonus:
+            graded_d = tilted - pd.Series(dbonus, index=tilted.index).fillna(0.0)
+            rank["ABDG"] = graded_d.dropna().sort_values(ascending=False, kind="stable")
+        else:
+            rank["ABDG"] = rank["A"]
+        # EXP-103 / EXP-102D (ASH): longs follow A; the short ranking blends
+        # A's pct rank with the EXP-080 habit rank (over-optimistic firms
+        # sink to the bottom of the short score). Habit = fc factor - 1
+        # during an episode, 0 elsewhere — identical to the book test.
+        rank["ASH"] = rank["A"]
+        s_t = tilted.dropna()
+        if len(s_t):
+            a_pct = s_t.rank(pct=True)
+            h_ser = pd.Series({x: fc_factors.get(x, 1.0) - 1.0 for x in s_t.index})
+            blend = (a_pct + (1.0 - h_ser.rank(pct=True))) / 2.0
+            rank["ASH_s"] = blend.sort_values(ascending=False, kind="stable")
+        else:
+            rank["ASH_s"] = rank["A"]
         vol60 = panel["C"].pct_change(fill_method=None).rolling(60, min_periods=40).std().loc[today]
         eq, npf = E3.fundamentals(fins, dates)
         mcap = panel["MktCap"].loc[today] * 1e6
@@ -1086,7 +1141,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75", "A625", "AB", "AVG", "ABG", "AV625", "ABD") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else (rank["AF15_s"] if name in ("AF15", "AF15625", "AVF15", "AVF625") else (rank["AF125_s"] if name == "AF125" else rank[name])))))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75/A625/AB/ABG shorts follow A; EXP-101: AV625/ABD shorts follow A, AVF625 shorts follow A_fc15; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc; AF15 shorts follow A_fc15 (EXP-081/082/086/089)
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75", "A625", "AB", "AVG", "ABG", "AV625", "ABD", "ABD625", "ABDG") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else (rank["AF15_s"] if name in ("AF15", "AF15625", "AVF15", "AVF625") else (rank["AF125_s"] if name == "AF125" else (rank["ASH_s"] if name == "ASH" else rank[name]))))))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75/A625/AB/ABG shorts follow A; EXP-101: AV625/ABD shorts follow A, AVF625 shorts follow A_fc15; EXP-103: ABD625/ABDG shorts follow A, ASH shorts follow the habit-blended ranking; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc; AF15 shorts follow A_fc15 (EXP-081/082/086/089)
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -1115,7 +1170,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）", "AF15": "AF15（ペーパー：A＋予想の癖による割引×1.5）", "A625": "A625（ペーパー：A＋ショート比率0.625）", "AB": "AB（ペーパー：A＋大量保有の買い増し追随）", "ABG": "ABG（ペーパー：A＋大量保有の買い増し追随・段階化強）", "AF125": "AF125（ペーパー：A＋予想の癖による割引×1.25）", "AF15625": "AF15625（ペーパー：AF×1.5＋ショート比率0.625）", "AVF15": "AVF15（ペーパー：AVボーナス＋予想の癖×1.5）", "AVG": "AVG（ペーパー：A＋任意開示ボーナスの段階化）", "AVF625": "AVF625（ペーパー：AVF15×ショート比率0.625）", "AV625": "AV625（ペーパー：AV×ショート比率0.625）", "ABD": "ABD（ペーパー：A＋大量保有の減少ペナルティ）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）", "AF15": "AF15（ペーパー：A＋予想の癖による割引×1.5）", "A625": "A625（ペーパー：A＋ショート比率0.625）", "AB": "AB（ペーパー：A＋大量保有の買い増し追随）", "ABG": "ABG（ペーパー：A＋大量保有の買い増し追随・段階化強）", "AF125": "AF125（ペーパー：A＋予想の癖による割引×1.25）", "AF15625": "AF15625（ペーパー：AF×1.5＋ショート比率0.625）", "AVF15": "AVF15（ペーパー：AVボーナス＋予想の癖×1.5）", "AVG": "AVG（ペーパー：A＋任意開示ボーナスの段階化）", "AVF625": "AVF625（ペーパー：AVF15×ショート比率0.625）", "AV625": "AV625（ペーパー：AV×ショート比率0.625）", "ABD": "ABD（ペーパー：A＋大量保有の減少ペナルティ）", "ABD625": "ABD625（ペーパー：ABD×ショート比率0.625）", "ABDG": "ABDG（ペーパー：A＋大量保有の減少ペナルティ・段階化）", "ASH": "ASH（ペーパー：A＋予想の癖のショート側適用）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
