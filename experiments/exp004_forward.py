@@ -53,7 +53,7 @@ TRAIN_END = pd.Timestamp("2026-08-26")  # last signal date whose 20-day target i
 TRAP_MAX = 3  # L keeps stocks with trap_risk <= 3; unscored stocks count as 3
 PDF_PAGES = 6  # the summary and the management discussion come first in a 決算短信
 MAX_CALLS_PER_RUN = 25  # stay well inside the subscription's usage limits per daily run
-PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75", "AF15", "A625", "AB", "ABG", "AF125", "AF15625", "AVF15", "AVG", "AVF625", "AV625", "ABD", "ABD625", "ABDG", "ASH", "ABRW")
+PORTFOLIOS = ("R", "M", "L", "W", "V", "S", "A", "AR", "AA", "AV", "A75", "AT", "AF", "A75F", "AV75", "AVF", "AV75F", "ATOW75", "AF15", "A625", "AB", "ABG", "AF125", "AF15625", "AVF15", "AVG", "AVF625", "AV625", "ABD", "ABD625", "ABDG", "ASH", "ABRW", "AGN")
 SHORT_FRAC, SHORT_CARRY = 0.5, 0.03  # EXP-009 S: short the bottom names for 50% of equity, 3%/yr carry
 SHORT_FRAC_BY = {"A75": 0.75, "A75F": 0.75, "AV75": 0.75, "AV75F": 0.75, "ATOW75": 0.75, "A625": 0.625, "AF15625": 0.625, "AVF625": 0.625, "AV625": 0.625, "ABD625": 0.625}  # EXP-103: ABD625 (EXP-102A) runs the ABD score with the 0.625 short lever  # EXP-101: AVF625 (EXP-100A) and AV625 (EXP-100C) run the AVF15 / AV scores with the 0.625 short lever  # EXP-074: A75 runs A's score with a 0.75 short fraction (operational DD test, paper only); EXP-082: A75F/AV75 stack the same lever on AF/AV; EXP-086: AV75F/ATOW75 likewise; EXP-089: A625 is the middle dose
 REAL = "V"  # EXP-008: real money follows V (same picks as R, cash split by 1/volatility)
@@ -71,6 +71,7 @@ def update_data() -> None:
                       "broad_events": update_broad_events(codes, days=10),
                       "decrease_events": update_decrease_events(codes, days=10),
                       "borrow_events": update_borrow_events(codes, days=10),
+                      "guidance_events": update_guidance_events(codes, days=10),
                       "voluntary_events": update_voluntary_events(codes, days=10)},
                      ensure_ascii=False))
 
@@ -747,6 +748,152 @@ def borrow_flags(today: pd.Timestamp, dates: pd.DatetimeIndex) -> set[str]:
     return out
 
 
+def update_guidance_events(codes: list[str], days: int = 10) -> dict:
+    """EXP-115: append raw FY fins records (the EXP-114 guidance
+    feed) to forward/guidance_events.csv, fetched from J-Quants
+    /v2/fins/summary by disclosure date. The CSV stores every
+    record with CurPerType == "FY" (date, code, fy_end, np, nxfnp,
+    disc_no); guidance_flags() re-derives the EXP-114 disclosures
+    from the raw rows, so a correction arriving later simply joins
+    its (code, CurFYEn) group and the adopted row moves, exactly
+    as in the book test. Rows are append-only (file order is the
+    tie-break record for same-day rows, matching the cache build).
+    Never raises: a feed failure must not stop the daily routine."""
+    path = FWD / "guidance_events.csv"
+    cols = ["date", "code", "fy_end", "np", "nxfnp", "disc_no"]
+    seen, rows = set(), []
+    if path.exists():
+        ev = pd.read_csv(path, dtype=str).fillna("")
+        for _, r in ev.iterrows():
+            row = {c: str(r.get(c, "")) for c in cols}
+            row["date"] = row["date"][:10]
+            rows.append(row)
+            seen.add(row["disc_no"] or (row["date"], row["code"],
+                                        row["fy_end"], row["np"],
+                                        row["nxfnp"]))
+    universe = set(codes)
+    added = 0
+    try:
+        sys.path.insert(0, str(Path.home() / "workspace" / "custom-connectors" / "custom.jquants" / "bin"))
+        from jquants_api import get_json
+        today = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize()
+        for back in range(days):
+            day = today - pd.Timedelta(days=back)
+            data = get_json("/v2/fins/summary",
+                            {"date": day.strftime("%Y%m%d")})
+            for d in data.get("data", []):
+                raw = str(d.get("Code", ""))
+                code = raw[:4] if len(raw) == 5 and raw.endswith("0") else raw
+                if code not in universe:
+                    continue
+                if str(d.get("CurPerType")) != "FY":
+                    continue
+                row = {"date": str(d.get("DiscDate"))[:10], "code": code,
+                       "fy_end": str(d.get("CurFYEn") or ""),
+                       "np": str(d.get("NP") or ""),
+                       "nxfnp": str(d.get("NxFNp") or ""),
+                       "disc_no": str(d.get("DiscNo") or "")}
+                key = row["disc_no"] or (row["date"], row["code"],
+                                         row["fy_end"], row["np"],
+                                         row["nxfnp"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+                added += 1
+    except Exception as e:  # feed failure: keep existing events
+        print(f"guidance_events update failed: {str(e)[:200]}")
+    pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
+    return {"added": added, "total": len(rows)}
+
+
+_GUIDANCE_DISC_CACHE: dict = {"key": None, "val": {}}
+
+
+def _guidance_disclosures() -> dict:
+    """EXP-115: {code: [(DiscDate, flag), ...] in DiscDate order}
+    derived from forward/guidance_events.csv under the EXP-114
+    definition, identical to EXP-114's build_fy_frame: per
+    (code, CurFYEn) the last DiscDate row carrying an actual NP
+    defines the disclosure; NxFNp falls back to the latest
+    NxFNp-carrying row of the group when the adopted row lacks it;
+    flag = NxFNp/NP - 1 <= -0.10 with NP and NxFNp both positive
+    and non-missing. Cached on the file's mtime/size."""
+    path = FWD / "guidance_events.csv"
+    if not path.exists():
+        return {}
+    try:
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _GUIDANCE_DISC_CACHE["key"] == key:
+        return _GUIDANCE_DISC_CACHE["val"]
+    out: dict = {}
+    try:
+        ev = pd.read_csv(path, dtype=str).fillna("")
+        raw = pd.DataFrame({
+            "code": ev["code"].astype(str).str[:4],
+            "fy_en": ev["fy_end"], "disc": ev["date"],
+            "NP": pd.to_numeric(ev["np"], errors="coerce"),
+            "NxFNp": pd.to_numeric(ev["nxfnp"], errors="coerce")})
+        d = raw[raw["disc"] != ""].copy().sort_values(
+            ["code", "fy_en", "disc"])
+        base = d[d["NP"].notna()].groupby(["code", "fy_en"],
+                                          as_index=False).tail(1).copy()
+        nx_latest = (d[d["NxFNp"].notna()].groupby(
+            ["code", "fy_en"], as_index=False).tail(1)
+            [["code", "fy_en", "NxFNp"]]
+            .rename(columns={"NxFNp": "NxFNp_fb"}))
+        base = base.merge(nx_latest, on=["code", "fy_en"], how="left")
+        base["NxFNp"] = base["NxFNp"].fillna(base["NxFNp_fb"])
+        g = base["NxFNp"] / base["NP"].replace(0, np.nan) - 1.0
+        g[(base["NP"] <= 0) | (base["NxFNp"] <= 0)] = np.nan
+        base["flag"] = g <= -0.10
+        base = base.sort_values(["code", "disc"])
+        for code, grp in base.groupby("code"):
+            out[str(code)] = [(pd.Timestamp(dd), bool(fl))
+                              for dd, fl in zip(grp["disc"], grp["flag"])]
+    except Exception:
+        out = {}
+    _GUIDANCE_DISC_CACHE.update(key=key, val=out)
+    return out
+
+
+def guidance_flags(today: pd.Timestamp, dates: pd.DatetimeIndex) -> set[str]:
+    """EXP-114/115: codes whose 60-trading-day downbeat-guidance
+    flag covers `today`. Under EXP-114's registered construction a
+    qualifying FY disclosure sets the flag for [eff, eff+60)
+    trading days (eff = first trading day after DiscDate) and a
+    non-qualifying FY disclosure expires any active flag from its
+    eff, so the most recent disclosure at or before `today`
+    decides. `dates` is the trading-day index available in
+    step_day; a warmup slice gives the same set as the full index
+    for any day at least 60 trading days into the slice.
+    Missing/unreadable file -> no penalties."""
+    disc_map = _guidance_disclosures()
+    if not disc_map or len(dates) == 0:
+        return set()
+    dv = dates.to_numpy()
+    idx = int(np.searchsorted(dv, np.datetime64(today)))
+    if idx >= len(dv) or dv[idx] != np.datetime64(today):
+        idx -= 1  # today not a trading day in this slice: use the last day <= today
+    if idx < 0:
+        return set()
+    out = set()
+    for code, discs in disc_map.items():
+        chosen = None
+        for disc, fl in discs:
+            eff = int(np.searchsorted(dv, np.datetime64(disc),
+                                      side="right"))
+            if eff > idx:
+                break
+            chosen = (eff, fl)
+        if chosen is not None and chosen[1] and idx < chosen[0] + 60:
+            out.add(code)
+    return out
+
+
 def decrease_flags(today: pd.Timestamp) -> set[str]:
     """EXP-100D/101: codes within 120 calendar days after a large-
     holding decrease event (active from the day after submission)."""
@@ -970,6 +1117,10 @@ def load_state() -> dict:
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["ABRW"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
                              "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
+        if "AGN" not in state:  # EXP-115: AGN = A with the EXP-114 downbeat-guidance penalty on the long side
+            pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
+            state["AGN"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
+                            "shorts": [{} for _ in range(N_TRANCHES)], "realized": 0.0, "pending": pend}
         if "V" not in state:  # EXP-008: V starts with R's first orders
             pend = json.loads(json.dumps(state["R"]["pending"])) if state["R"]["pending"] else None
             state["V"] = {"tranches": [{"cash": BUDGET / N_TRANCHES, "holdings": {}} for _ in range(N_TRANCHES)],
@@ -1081,6 +1232,12 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
         rank["AT"] = rank["A"][[x not in tflag for x in rank["A"].index]]  # EXP-077: long-side exclusion of transitional stocks
         brw = borrow_flags(today, dates)
         rank["ABRW"] = rank["A"][[x not in brw for x in rank["A"].index]]  # EXP-111: long-side exclusion of borrow-flagged names
+        gflag = guidance_flags(today, dates)
+        if gflag:
+            penalized_g = tilted - 0.10 * tilted.index.isin(gflag)
+            rank["AGN"] = penalized_g.dropna().sort_values(ascending=False, kind="stable")
+        else:
+            rank["AGN"] = rank["A"]  # EXP-115: AGN = A with the EXP-114 downbeat-guidance penalty (-0.10) on the long side
         vd = voluntary_bonus(today)
         if vd:
             boosted_v = tilted + 0.10 * tilted.index.isin(vd)
@@ -1229,7 +1386,7 @@ def step_day(state: dict, topix: pd.DataFrame, panel: dict, fins: dict) -> None:
                 others_s = set().union(*(pf["shorts"][m] for m in range(N_TRANCHES) if m not in due))
                 sorders, taken_s = {}, set()
                 for k in due:
-                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75", "A625", "AB", "AVG", "ABG", "AV625", "ABD", "ABD625", "ABDG", "ABRW") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else (rank["AF15_s"] if name in ("AF15", "AF15625", "AVF15", "AVF625") else (rank["AF125_s"] if name == "AF125" else (rank["ASH_s"] if name == "ASH" else rank[name]))))))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75/A625/AB/ABG shorts follow A; EXP-101: AV625/ABD shorts follow A, AVF625 shorts follow A_fc15; EXP-103: ABD625/ABDG shorts follow A, ASH shorts follow the habit-blended ranking; EXP-111: ABRW shorts follow A; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc; AF15 shorts follow A_fc15 (EXP-081/082/086/089)
+                    srank = rank["A"] if name in ("AR", "AV", "A75", "AT", "AV75", "ATOW75", "A625", "AB", "AVG", "ABG", "AV625", "ABD", "ABD625", "ABDG", "ABRW", "AGN") else (rank["AA_s"] if name == "AA" else (rank["AF_s"] if name in ("AF", "AVF") else (rank["A75F_s"] if name in ("A75F", "AV75F") else (rank["AF15_s"] if name in ("AF15", "AF15625", "AVF15", "AVF625") else (rank["AF125_s"] if name == "AF125" else (rank["ASH_s"] if name == "ASH" else rank[name]))))))  # EXP-047/053/055/077: AR/AV/A75/AT/AV75/ATOW75/A625/AB/ABG shorts follow A; EXP-101: AV625/ABD shorts follow A, AVF625 shorts follow A_fc15; EXP-103: ABD625/ABDG shorts follow A, ASH shorts follow the habit-blended ranking; EXP-111: ABRW shorts follow A; EXP-115: AGN shorts follow A; AA shorts follow A minus activist-flagged names; AF/AVF/A75F/AV75F shorts follow A_fc; AF15 shorts follow A_fc15 (EXP-081/082/086/089)
                     pool = [x for x in srank.index[::-1] if x not in others_s and x not in taken_s]
                     sorders[str(k)] = pool[:PER_TRANCHE + SPARE]
                     taken_s |= set(pool[:PER_TRANCHE])
@@ -1258,7 +1415,7 @@ def write_order_sheet(state: dict, today, nxt, due) -> None:
     lines = [f"# {nxt.date()} の寄付の注文（{today.date()} の終値で決定）", ""]
     for name in PORTFOLIOS:
         pf = state[name]
-        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）", "AF15": "AF15（ペーパー：A＋予想の癖による割引×1.5）", "A625": "A625（ペーパー：A＋ショート比率0.625）", "AB": "AB（ペーパー：A＋大量保有の買い増し追随）", "ABG": "ABG（ペーパー：A＋大量保有の買い増し追随・段階化強）", "AF125": "AF125（ペーパー：A＋予想の癖による割引×1.25）", "AF15625": "AF15625（ペーパー：AF×1.5＋ショート比率0.625）", "AVF15": "AVF15（ペーパー：AVボーナス＋予想の癖×1.5）", "AVG": "AVG（ペーパー：A＋任意開示ボーナスの段階化）", "AVF625": "AVF625（ペーパー：AVF15×ショート比率0.625）", "AV625": "AV625（ペーパー：AV×ショート比率0.625）", "ABD": "ABD（ペーパー：A＋大量保有の減少ペナルティ）", "ABD625": "ABD625（ペーパー：ABD×ショート比率0.625）", "ABDG": "ABDG（ペーパー：A＋大量保有の減少ペナルティ・段階化）", "ASH": "ASH（ペーパー：A＋予想の癖のショート側適用）", "ABRW": "ABRW（ペーパー：A＋借株フラグによるロング除外）"}[name]
+        title = {"R": "R（ペーパー：ルール・等金額）", "M": "M（ペーパー：LightGBM）", "L": "L（ペーパー：Claude が決算短信を確認）", "W": "W（ペーパー：点数で金額を配分）", "V": "V（実運用：値動きで金額を配分）", "S": "S（ペーパー：上位を買い、下位を空売り）", "A": "A（ペーパー：決算モメンタム傾斜つきロング・ショート）", "AR": "AR（ペーパー：A＋訂正反復スクリーン）", "AA": "AA（ペーパー：A＋アクティビスト追随）", "AV": "AV（ペーパー：A＋任意開示の厚み）", "A75": "A75（ペーパー：A＋ショート比率0.75）", "AT": "AT（ペーパー：A＋TOPIX移行措置銘柄の回避）", "AF": "AF（ペーパー：A＋予想の癖による割引）", "A75F": "A75F（ペーパー：AF×ショート比率0.75）", "AV75": "AV75（ペーパー：AV×ショート比率0.75）", "AVF": "AVF（ペーパー：AV＋予想の癖の割引）", "AV75F": "AV75F（ペーパー：AVF×ショート比率0.75）", "ATOW75": "ATOW75（観測専用：綱引き×ショート比率0.75）", "AF15": "AF15（ペーパー：A＋予想の癖による割引×1.5）", "A625": "A625（ペーパー：A＋ショート比率0.625）", "AB": "AB（ペーパー：A＋大量保有の買い増し追随）", "ABG": "ABG（ペーパー：A＋大量保有の買い増し追随・段階化強）", "AF125": "AF125（ペーパー：A＋予想の癖による割引×1.25）", "AF15625": "AF15625（ペーパー：AF×1.5＋ショート比率0.625）", "AVF15": "AVF15（ペーパー：AVボーナス＋予想の癖×1.5）", "AVG": "AVG（ペーパー：A＋任意開示ボーナスの段階化）", "AVF625": "AVF625（ペーパー：AVF15×ショート比率0.625）", "AV625": "AV625（ペーパー：AV×ショート比率0.625）", "ABD": "ABD（ペーパー：A＋大量保有の減少ペナルティ）", "ABD625": "ABD625（ペーパー：ABD×ショート比率0.625）", "ABDG": "ABDG（ペーパー：A＋大量保有の減少ペナルティ・段階化）", "ASH": "ASH（ペーパー：A＋予想の癖のショート側適用）", "ABRW": "ABRW（ペーパー：A＋借株フラグによるロング除外）", "AGN": "AGN（ペーパー：A＋来期減益ガイダンスのペナルティ）"}[name]
         lines += [f"## {title}", "", "| 組 | 売る（寄成） | 買う（寄成、上から2つ。寄付がつかなければ次の候補） |", "|---|---|---|"]
         for k, cands in pf["pending"]["orders"].items():
             sell = "、".join(nm(x) for x in sorted(pf["tranches"][int(k)]["holdings"])) or "なし"
